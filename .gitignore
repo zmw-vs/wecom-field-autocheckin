@@ -1,0 +1,27 @@
+# Gradle 构建产物
+.gradle/
+build/
+app/build/
+.kotlin/
+
+# 本机 SDK 路径（各人环境不同，不入库）
+local.properties
+
+# IDE 垃圾
+.idea/
+*.iml
+out/
+*.ipr
+*.iws
+
+# 调试产物：uiautomator dump 与调试截图
+/ui*.xml
+/*.png
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 签名密钥（若有）
+*.jks
+*.keystore

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">外勤打卡助手</string>
+    <string name="service_label">外勤打卡助手</string>
+    <string name="accessibility_desc">外勤打卡助手：读取企业微信页面，模拟点击打卡按钮；不上传数据，不修改定位。开启后才能实现自动打卡。</string>
+
+    <string name="title_settings">打卡时间</string>
+    <string name="label_up">上班提醒时间</string>
+    <string name="label_down">下班提醒时间</string>
+    <string name="label_weekday">生效日期</string>
+    <string name="label_auto_click">解锁后自动点击打卡</string>
+    <string name="label_enable">启用定时任务</string>
+
+    <string name="btn_permission">权限检查</string>
+    <string name="btn_test">立即测试一次</string>
+    <string name="btn_clear_log">清空日志</string>
+
+    <string name="notif_channel_name">打卡提醒</string>
+    <string name="notif_title_due">该打卡了</string>
+    <string name="notif_text_due">点此打开企业微信完成打卡</string>
+</resources>

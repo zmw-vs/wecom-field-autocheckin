@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 任务书 6.3：
+     packageNames 只监听企业微信，不监听全系统（省电关键，不得删除）；
+     canRetrieveWindowContent 必须开，否则拿不到节点；
+     canPerformGestures=true：正常流程只用 performAction(ACTION_CLICK)，
+       仅当企微小程序的胶囊「···」不暴露为节点时，退化为在右上角下发一次手势点击；
+     flagIncludeNotImportantViews：部分企微按钮标记为 not-important，开启以保证能取到；
+     notificationTimeout=300：合并同类事件，降低高频唤醒（省电附加项）。 -->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeViewClicked|typeViewFocused|typeViewScrolled"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagIncludeNotImportantViews"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_desc"
+    android:notificationTimeout="300"
+    android:packageNames="com.tencent.wework" />

@@ -60,6 +60,18 @@ class CheckInAccessibilityService : AccessibilityService() {
 
         private val DONE_TEXTS = listOf("打卡成功", "已打卡", "更新打卡")
 
+        /**
+         * 点过「确认打卡」之后用来判成功的文案，比 DONE_TEXTS 宽。
+         * 外勤确认完企微不一定弹「打卡成功」四个字，也可能直接显示打卡时间/已打卡栏位。
+         * 只用于确认后的收尾判定，不影响 passiveScan 和「当前已是打卡状态」的严格判定。
+         */
+        private val SUCCESS_TEXTS = listOf(
+            "打卡成功", "已打卡", "更新打卡", "打卡完成", "今日已打卡", "打卡时间"
+        )
+
+        /** 点完「确认打卡」最多再等 4 轮（约 7 秒），够企微刷新结果，又不至于空转耗电 */
+        private const val CONFIRM_WAIT_TICKS = 4
+
         /** 预览页菜单里的「进入应用」，不同企微版本叫法略有差异 */
         private val ENTER_LABELS = listOf("进入应用", "打开应用", "进入小程序", "打开小程序", "立即进入")
 
@@ -398,27 +410,28 @@ class CheckInAccessibilityService : AccessibilityService() {
         }
 
         val root = rootInActiveWindow
-        if (root == null || root.packageName?.toString() != WEWORK) {
-            root.safeRecycle()
-            handler.postDelayed(tickRunnable, TICK)
+
+        // 「确认打卡」已点：工具能做的最后一步已经做完，后面交给企微自己校验。
+        // 这段判定必须放在「root 是否企微」检查之前：实测打卡成功后企微页面会收起，
+        // 或手机自动息屏导致 rootInActiveWindow 为 null；原先放在检查之后，永远走不到，
+        // 一路空转到 MAX_TICK 超时——明明打卡成功却弹「请手动补一下」（11-08、11-09 连着三次）。
+        if (confirmTick >= 0) {
+            handleAfterConfirm(root)
             return
         }
 
-        // 「确认打卡」已点：外勤只剩拍照/人脸/位置这类必须本人参与的步骤，
-        // 等几轮「打卡成功」，等不到就通知用户手动完成（自动化到此为止，不伪造任何东西）
-        if (confirmTick >= 0) {
-            val dt = firstDoneText(root)
-            if (dt != null && dt.contains("打卡成功")) {
-                root.safeRecycle()
-                finish(true, "打卡成功")
-                return
-            }
-            if (ticks - confirmTick >= 5) {
-                root.safeRecycle()
-                finish(false, "已点「确认打卡」进入拍照/位置确认环节，请手动完成打卡")
-                return
-            }
+        if (root == null || root.packageName?.toString() != WEWORK) {
             root.safeRecycle()
+            // 已经点过打卡按钮，企微却不在前台：多半是打卡后页面收起、手机息屏或跳去拍照页。
+            // 不能一路空转到超时判「未完成」，否则就是「打完了还催补卡」。
+            // 这里没走到「确认打卡」，留一条中性提醒（不带补卡字样）防止真需要拍照时漏卡。
+            if (punchClicks > 0 && ticks - lastPunchTick >= 3) {
+                finishSubmitted(
+                    "已点打卡按钮（$slot），企微页面已收起，结果以企微为准",
+                    remind = true
+                )
+                return
+            }
             handler.postDelayed(tickRunnable, TICK)
             return
         }
@@ -547,6 +560,53 @@ class CheckInAccessibilityService : AccessibilityService() {
 
         root.safeRecycle()
         handler.postDelayed(tickRunnable, TICK)
+    }
+
+    /**
+     * 点过「确认打卡」后的收尾。到这里工具已经没有可点的东西了：外勤确认弹窗是最后一步，
+     * 剩下的定位/拍照/人脸由企微自己完成。三种结局都不再报「未完成 / 请手动补一下」：
+     *   1) 读到完成文案、或完成状态已写入 → 明确成功；
+     *   2) 企微不在前台（页面收起 / 自动息屏）→ 视为已提交，静默收尾；
+     *   3) 等满 CONFIRM_WAIT_TICKS 仍无结果 → 视为已提交，静默收尾。
+     */
+    private fun handleAfterConfirm(root: AccessibilityNodeInfo?) {
+        val pkg = root?.packageName?.toString()
+        val inWework = pkg == WEWORK
+
+        if (inWework) {
+            val dt = firstSuccessText(root!!)
+            if (dt != null) {
+                root.safeRecycle()
+                finish(true, "打卡成功（识别文案=$dt）")
+                return
+            }
+        }
+        root.safeRecycle()
+
+        if (!testing && Prefs.isDone(this, slot)) {
+            finish(true, "检测到今日$slot 已完成")
+            return
+        }
+
+        if (!inWework) {
+            val why = if (pkg == null) "页面已收起/已息屏" else "前台=$pkg"
+            finishSubmitted("已提交「确认打卡」，企微不在前台（$why），结果以企微为准")
+            return
+        }
+
+        if (ticks - confirmTick >= CONFIRM_WAIT_TICKS) {
+            finishSubmitted("已提交「确认打卡」，未读到完成文案，结果请在企微确认")
+            return
+        }
+
+        handler.postDelayed(tickRunnable, TICK)
+    }
+
+    private fun firstSuccessText(root: AccessibilityNodeInfo): String? {
+        for (t in SUCCESS_TEXTS) {
+            if (exists(root, listOf(t))) return t
+        }
+        return null
     }
 
     /** 优先用节点自带的滚动动作（省电、稳），没有再退化为手势上滑 */
@@ -763,13 +823,40 @@ class CheckInAccessibilityService : AccessibilityService() {
             Prefs.log(this, prefix + "完成：" + msg)
             Notifier.alert(this, prefix + "打卡完成（" + slot + "）", msg)
         } else {
+            // 兜底：流程判失败但完成状态其实已经写入（用户手动打过、被动检测刚标上），
+            // 就别再弹「请手动补一下」了，否则会出现「已经打卡成功还被催补卡」的误报。
+            if (!wasTest && Prefs.isDone(this, slot)) {
+                Prefs.log(this, "流程未走完但今日$slot 已完成，按完成收尾（原判定：$msg）")
+                return
+            }
             Prefs.log(this, prefix + "失败：" + msg)
             Notifier.alert(this, prefix + "打卡未完成（" + slot + "）", msg + "，请手动补一下")
         }
     }
 
+    /**
+     * 「已提交」收尾：确认按钮已经点下去，结果由企微决定，工具不替用户判定成败。
+     * 静默记日志、清 pending，并写内部完成标记，防止到点/解锁时重复触发再点一次。
+     * 这个 markDone 只是工具内部「别再重复点」的标记，不是考勤记录。
+     */
+    private fun finishSubmitted(msg: String, remind: Boolean = false) {
+        val wasTest = testing
+        running = false
+        testing = false
+        handler.removeCallbacksAndMessages(null)
+        val prefix = if (wasTest) "[测试] " else ""
+        if (!wasTest) {
+            Prefs.clearPending(this)
+            Prefs.markDone(this, slot)
+            if (remind) Notifier.alert(this, "打卡已提交（" + slot + "）", msg)
+        }
+        Prefs.log(this, prefix + "已提交：" + msg)
+    }
+
     /** 卡住时告诉用户停在哪一步，日志里直接能看出该补哪个环节 */
     private fun stageName(): String = when {
+        confirmTick >= 0 -> "已点「确认打卡」，等待企微确认结果"
+        punchClicks > 0 -> "点击上班/下班打卡按钮"
         enteredApp -> "点击上班/下班打卡按钮"
         entryClicks == 0 && !wentWorkbench -> "打开企微工作台"
         entryClicks == 0 -> "点击工作台上的打卡入口"

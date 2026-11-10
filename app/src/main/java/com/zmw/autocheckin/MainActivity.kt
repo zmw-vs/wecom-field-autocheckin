@@ -46,6 +46,7 @@ class MainActivity : Activity() {
     private lateinit var swEnable: Switch
     private lateinit var swAuto: Switch
     private lateinit var btnSettings: Button
+    private lateinit var btnStatusPush: Button
     private lateinit var tvState: TextView
     private lateinit var tvLog: TextView
 
@@ -55,6 +56,9 @@ class MainActivity : Activity() {
         refresh()
         bind()
         askNotificationPermission()
+        // 状态推送是独立开关：打开一次 App 就把每日闹钟排上，
+        // 不依赖无障碍服务是否已连接
+        CheckInScheduler.scheduleStatus(this)
         // 当年没在线数据时静默拉一次（有缓存则不产生任何请求），完成后刷新界面
         HolidayRepo.ensureYearAsync(this, Calendar.getInstance().get(Calendar.YEAR)) { _, _ -> refresh() }
     }
@@ -91,6 +95,14 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(10), dp(12), dp(10))
         }
         root.addView(btnSettings)
+
+        // 每日打卡状态推送：独立的开关 + 每日时间 + 数据源，跟「自动打卡设置」互不干扰
+        btnStatusPush = Button(this).apply {
+            textSize = 14f
+            isAllCaps = false
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+        }
+        root.addView(btnStatusPush)
 
         swAuto = Switch(this).apply { text = "解锁后自动点击打卡" }
         root.addView(swAuto)
@@ -147,6 +159,7 @@ class MainActivity : Activity() {
         }
         swAuto.setOnCheckedChangeListener { _, v -> Prefs.setAutoClick(this, v) }
         btnSettings.setOnClickListener { openSettingsDialog() }
+        btnStatusPush.setOnClickListener { openStatusPushDialog() }
     }
 
     private fun refresh() {
@@ -162,6 +175,13 @@ class MainActivity : Activity() {
             "　" + holidayModeText(Prefs.holidayMode(this)) +
             (if (offCount > 0) "　另休 " + offCount + " 天" else "")
 
+        val pushOn = Prefs.statusPushEnabled(this)
+        val pushTime = hhmm(Prefs.statusPushMinutes(this))
+        val pushSrc = if (Prefs.statusUseApi(this)) "企业微信接口" else "本机记录"
+        btnStatusPush.text = "状态推送\n" + (if (pushOn) "开 · " else "关 · ") +
+            pushTime + " · " + pushSrc
+        btnStatusPush.setTextColor(if (pushOn) COLOR_OK else COLOR_MUTED)
+
         val ready = CheckInAccessibilityService.isReady()
         val todayCal = nowCal
         val workToday = WorkDay.isWorkDay(this, todayCal)
@@ -172,6 +192,10 @@ class MainActivity : Activity() {
             sb.append("   上班").append(if (Prefs.isDone(this, "上班")) " ✓已打" else " 未打")
             sb.append("   下班").append(if (Prefs.isDone(this, "下班")) " ✓已打" else " 未打")
         }
+        sb.append("\n状态推送：")
+            .append(if (pushOn) "开 · $pushTime · $pushSrc" else "关（不会触发定时推送）")
+        val last = Prefs.statusLastResult(this)
+        if (last.isNotEmpty()) sb.append("\n上次推送：").append(last.take(70))
         tvState.text = sb.toString()
         // 今日不打卡时用中性色，避免误以为出了故障
         tvState.setTextColor(
@@ -275,6 +299,228 @@ class MainActivity : Activity() {
             .setNegativeButton("关闭", null)
             .create()
         dlg.show()
+    }
+
+    // ---------------- 每日打卡状态推送 ----------------
+
+    /**
+     * 一个入口看清四件事：开关状态、每日时间、当前数据源、接口配置缺什么。
+     * 颜色沿用自动打卡设置的语义：绿=生效，蓝=真实接口，橙=配置不全，灰=无。
+     */
+    private fun openStatusPushDialog() {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(8), dp(16), dp(0))
+        }
+        var dlg: AlertDialog? = null
+
+        fun item(title: String, value: String, valueColor: Int, action: () -> Unit) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(14), dp(9), dp(14), dp(9))
+                isClickable = true
+                isFocusable = true
+                setBackgroundColor(0xFFF6F7F9.toInt())
+                setOnClickListener {
+                    dlg?.dismiss()
+                    action()
+                }
+            }
+            row.addView(TextView(this).apply {
+                text = title
+                textSize = 12f
+                setTextColor(0xFF6B7280.toInt())
+            })
+            row.addView(TextView(this).apply {
+                text = value
+                textSize = 15f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(valueColor)
+                setPadding(0, dp(3), 0, 0)
+            })
+            box.addView(
+                row,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(7) }
+            )
+        }
+
+        val on = Prefs.statusPushEnabled(this)
+        val time = hhmm(Prefs.statusPushMinutes(this))
+        val useApi = Prefs.statusUseApi(this)
+        val problem = Prefs.statusConfigProblem(this)
+
+        item(
+            "定时状态推送开关",
+            if (on) "已开启 · 每天 $time 推送" else "已关闭 · 不会触发定时推送",
+            if (on) COLOR_OK else COLOR_MUTED
+        ) { pickStatusSwitch() }
+
+        item("每日推送时间", time, COLOR_NEUTRAL) { pickStatusTime() }
+
+        item(
+            "状态数据源",
+            if (useApi) "企业微信接口（凭证已配齐）" else "本机记录（推荐 · 无需凭证）",
+            if (useApi) COLOR_INFO else COLOR_OK
+        ) { editStatusApi() }
+
+        item(
+            "接口配置",
+            problem ?: "已配置 · " + Prefs.statusUserId(this),
+            if (problem == null) COLOR_OK else COLOR_WARN
+        ) { editStatusApi() }
+
+        item("上次推送结果", Prefs.statusLastResult(this).ifEmpty { "暂无" }, COLOR_MUTED) {
+            AlertDialog.Builder(this)
+                .setTitle("上次推送结果")
+                .setMessage(Prefs.statusLastResult(this).ifEmpty { "暂无记录" })
+                .setPositiveButton("关闭", null)
+                .show()
+        }
+
+        box.addView(Button(this).apply {
+            text = "立即查询并推送一次（不影响每日去重）"
+            textSize = 14f
+            isAllCaps = false
+            setOnClickListener {
+                dlg?.dismiss()
+                testStatusPushNow()
+            }
+        })
+
+        box.addView(TextView(this).apply {
+            text = "说明：没有企业管理员 access_token 时默认用本机记录，推送文案会标注来源；" +
+                "接口失败、无数据、非工作日、未到打卡时间都只推「状态未确认」，" +
+                "不会误报为已打卡/未打卡。"
+            textSize = 12f
+            setTextColor(0xFF37474F.toInt())
+            setPadding(dp(4), dp(8), dp(4), dp(8))
+        })
+
+        dlg = AlertDialog.Builder(this)
+            .setTitle("打卡状态推送")
+            .setView(ScrollView(this).apply { addView(box) })
+            .setNegativeButton("关闭", null)
+            .create()
+        dlg.show()
+    }
+
+    private fun pickStatusSwitch() {
+        val cur = Prefs.statusPushEnabled(this)
+        showChoiceDialog(
+            title = "定时状态推送",
+            message = "开启后每天在设定时间推送当日打卡状态；关闭时不排闹钟、不推送。\n" +
+                "与「启用定时任务」相互独立，关掉自动打卡也能单独用状态推送。",
+            options = listOf(
+                (if (!cur) "✓ " else "　") + "关闭（不触发定时推送）",
+                (if (cur) "✓ " else "　") + "开启（每日一次）"
+            ),
+            highlight = if (cur) 1 else 0
+        ) { which ->
+            val v = which == 1
+            Prefs.setStatusPushEnabled(this, v)
+            if (v) CheckInScheduler.scheduleStatus(this) else CheckInScheduler.cancelStatus(this)
+            Prefs.log(this, "状态推送开关改为：" + (if (v) "开" else "关"))
+            refresh()
+        }
+    }
+
+    private fun pickStatusTime() {
+        val cur = Prefs.statusPushMinutes(this)
+        TimePickerDialog(this, { _, h, m ->
+            Prefs.setStatusPushMinutes(this, h * 60 + m)
+            CheckInScheduler.scheduleStatus(this)
+            Prefs.log(this, "状态推送时间改为 " + hhmm(h * 60 + m))
+            refresh()
+        }, cur / 60, cur % 60, true).show()
+    }
+
+    private fun editStatusApi() {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(10), dp(18), dp(4))
+        }
+        box.addView(TextView(this).apply {
+            text = "留空也能用：默认走本机记录，不查接口。\n" +
+                "企业微信 getcheckindata 需要企业管理员授权的应用 access_token 和本企业 userid；" +
+                "普通员工账号没有权限，填不全就继续用本机记录。\n" +
+                "三项填齐后自动切换为真实接口查询。"
+            textSize = 12f
+            setTextColor(0xFF555555.toInt())
+            setPadding(0, 0, 0, dp(10))
+        })
+
+        fun labeled(label: String, value: String, password: Boolean): EditText {
+            box.addView(TextView(this).apply {
+                text = label
+                textSize = 12f
+            })
+            val et = EditText(this).apply {
+                setText(value)
+                inputType = if (password) {
+                    InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                } else {
+                    InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+                }
+                setTextSize(13f)
+            }
+            box.addView(et)
+            return et
+        }
+
+        val etUrl = labeled("查询接口地址", Prefs.statusApiUrl(this), false)
+        val etToken = labeled("access_token（仅本地保存）", Prefs.statusApiToken(this), true)
+        val etUser = labeled("用户 ID（userid）", Prefs.statusUserId(this), false)
+
+        AlertDialog.Builder(this)
+            .setTitle("企业微信接口配置")
+            .setView(ScrollView(this).apply { addView(box) })
+            .setPositiveButton("保存") { _, _ ->
+                val u = etUrl.text.toString().trim()
+                if (u.isEmpty()) Prefs.resetStatusApiUrl(this) else Prefs.setStatusApiUrl(this, u)
+                Prefs.setStatusApiToken(this, etToken.text.toString())
+                Prefs.setStatusUserId(this, etUser.text.toString())
+                CheckInScheduler.scheduleStatus(this)
+                Prefs.log(
+                    this, "状态接口配置已更新，数据源：" +
+                        if (Prefs.statusUseApi(this)) "企业微信接口" else "本机记录"
+                )
+                refresh()
+            }
+            .setNeutralButton("清空凭证") { _, _ ->
+                Prefs.resetStatusApiUrl(this)
+                Prefs.setStatusApiToken(this, "")
+                Prefs.setStatusUserId(this, "")
+                CheckInScheduler.scheduleStatus(this)
+                Prefs.log(this, "已清空状态接口凭证，回到本机记录")
+                refresh()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 手动验一次文案与接口连通性，不写「今日已推送」标记，不影响定时去重 */
+    private fun testStatusPushNow() {
+        Toast.makeText(this, "正在查询打卡状态…", Toast.LENGTH_SHORT).show()
+        val app = applicationContext
+        Thread {
+            try {
+                val report = StatusPush.build(app)
+                StatusPush.send(app, report, false)
+                runOnUiThread {
+                    Toast.makeText(this, "已推送：" + report.title, Toast.LENGTH_LONG).show()
+                    refresh()
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    Toast.makeText(
+                        this, "查询失败：" + (e.message ?: "未知错误"), Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }.start()
     }
 
     /** 节假日规则对应的强调色 */

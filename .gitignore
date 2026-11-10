@@ -25,3 +25,7 @@ Thumbs.db
 # 签名密钥（若有）
 *.jks
 *.keystore
+keystore.properties
+
+# 构建出来的安装包
+*.apk

@@ -64,5 +64,33 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+
+        <!-- 解锁补执行：静态注册，锁屏期间进程被省电策略杀掉后仍能被系统拉起。
+             另有 RTC 非唤醒闹钟兜底，不依赖这条广播能否被系统投递 -->
+        <receiver
+            android:name=".UnlockReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.USER_PRESENT" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 唤醒检查：显式 action，由本应用的 AlarmManager 投递，最可靠的一条兜底 -->
+        <receiver
+            android:name=".ResumeReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.zmw.autocheckin.action.RESUME" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 每日打卡状态推送：显式 action，开关关闭时不会排闹钟 -->
+        <receiver
+            android:name=".StatusPushReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.zmw.autocheckin.action.STATUS_DUE" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

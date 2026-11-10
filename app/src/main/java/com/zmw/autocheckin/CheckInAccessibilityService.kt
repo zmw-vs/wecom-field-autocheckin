@@ -43,10 +43,24 @@ class CheckInAccessibilityService : AccessibilityService() {
     companion object {
         const val WEWORK = "com.tencent.wework"
 
-        // 省电-3：轮询间隔放宽。多步流程（预览页加载 + 菜单展开）比原来长，
-        // 轮数上调到 30 轮 ≈ 55s 上限；正常一次只走十几轮就结束。
-        private const val TICK = 1700L
-        private const val MAX_TICK = 30
+        // 提速：页面一变化就由无障碍事件驱动立刻续跑，固定延迟只作兜底轮询。
+        // 总预算按真实时间算，不按轮数，避免事件密集时过早判超时。
+        private const val TICK = 800L
+        private const val MAX_TICK = 240
+        private const val MAX_RUN_MS = 45_000L
+        private const val FIRST_DELAY = 700L
+        private const val AFTER_TAB = 650L
+        private const val AFTER_ENTRY = 1100L
+        private const val AFTER_DOTS = 800L
+        private const val AFTER_ENTER = 1100L
+        private const val AFTER_PUNCH_1 = 1000L
+        private const val AFTER_PUNCH_N = 800L
+        private const val AFTER_SCROLL = 700L
+        private const val EVENT_TICK_DELAY = 160L
+        private const val MIN_TICK_GAP_MS = 350L
+        private const val ACTION_QUIET_MS = 450L
+        private const val SETTLE_MS = 1500L
+        private const val ENTRY_LOAD_MS = 900L
 
         /**
          * 各阶段独立限次。必须限制：点完一次后页面可能停在同一界面，
@@ -69,8 +83,9 @@ class CheckInAccessibilityService : AccessibilityService() {
             "打卡成功", "已打卡", "更新打卡", "打卡完成", "今日已打卡", "打卡时间"
         )
 
-        /** 点完「确认打卡」最多再等 4 轮（约 7 秒），够企微刷新结果，又不至于空转耗电 */
-        private const val CONFIRM_WAIT_TICKS = 4
+        /** 点完「确认打卡」最多再等 2.5 秒，够企微刷新结果，又不至于空转耗电 */
+        private const val CONFIRM_WAIT_MS = 2500L
+        private const val CONFIRM_WAIT_TICKS = 12
 
         /** 预览页菜单里的「进入应用」，不同企微版本叫法略有差异 */
         private val ENTER_LABELS = listOf("进入应用", "打开应用", "进入小程序", "打开小程序", "立即进入")
@@ -84,6 +99,9 @@ class CheckInAccessibilityService : AccessibilityService() {
         private var alive: CheckInAccessibilityService? = null
 
         fun isReady(): Boolean = alive != null
+
+        /** 供 PendingRunner 去重：解锁广播可能被静态 + 动态接收器各投一次 */
+        fun isRunning(): Boolean = alive?.running == true
 
         /**
          * @param force  跳过「今日已打卡」检查（手动点「立即打卡」时用）
@@ -139,6 +157,17 @@ class CheckInAccessibilityService : AccessibilityService() {
     private var wentWorkbench = false
     private var lastPassiveScan = 0L
 
+    /** 提速用：按真实时间判断静默期/页面已加载，不受事件驱动下 tick 频率变化影响 */
+    private var lastTickAt = 0L
+    private var lastActionAt = 0L
+    private var lastEntryAt = 0L
+    private var lastPunchAt = 0L
+    private var lastScrollAt = 0L
+    private var confirmAt = 0L
+
+    /** 仅执行期间动态开启内容变化事件，流程一结束立刻还原，平时零额外开销 */
+    private var contentEventsOn = false
+
     /** 各阶段点击计数，分别受限 */
     private var entryClicks = 0
     private var dotsClicks = 0
@@ -180,23 +209,10 @@ class CheckInAccessibilityService : AccessibilityService() {
             val ctx = c ?: return
             // 省电-6：今日两时段均已完成，解锁后零工作直接返回
             if (Prefs.isDone(ctx, "上班") && Prefs.isDone(ctx, "下班")) return
-            if (!Prefs.hasPending(ctx)) return
-            val slot = Prefs.pendingSlot(ctx)
-            if (Prefs.pendingAgeMs(ctx) > Prefs.PENDING_STALE_MS) {
-                Prefs.clearPending(ctx)
-                // Bug-7：超期丢弃不能只写日志，必须通知用户避免静默漏卡
-                Prefs.log(ctx, "锁屏待办已过期（超过2小时），丢弃")
-                Notifier.alert(ctx, "打卡任务已超期", "锁屏待办超时未执行，请手动打卡", openWework = true)
-                return
-            }
-            if (Prefs.isDone(ctx, slot)) {
-                Prefs.clearPending(ctx)
-                Prefs.log(ctx, "解锁时发现今日$slot 已打卡，取消补执行")
-                return
-            }
-            Prefs.log(ctx, "检测到解锁，继续未完成的打卡：$slot")
+            // 统一走 PendingRunner：过期/已完成/开关/服务未就绪都由它判断，
+            // 静态 UnlockReceiver 可能同时投递，isRunning() 会去重
             try {
-                begin(slot)
+                PendingRunner.tryResume(ctx, "解锁")
             } catch (e: Exception) {
                 Prefs.log(ctx, "解锁补执行失败：" + e.message)
             }
@@ -220,10 +236,24 @@ class CheckInAccessibilityService : AccessibilityService() {
         // 闹钟自愈兜底：重启后无障碍服务由系统自动重连（enabled_accessibility_services
         // 是持久化设置），比 BOOT_COMPLETED 广播更可靠——三星「自动运行」开关拦得住
         // 开机广播，拦不住系统自己重连无障碍。schedule() 幂等，重复调用只覆盖闹钟。
+        // 设备休眠期间 RTC 闹钟不会投递，唤醒后这条「到期未执行」的排定要先补触发，
+        // 否则下面的 schedule() 会把它 cancel 掉，锁屏那次打卡就彻底没了。
+        try {
+            DueHandler.recoverMissed(this)
+        } catch (e: Exception) {
+            Prefs.log(this, "补触发到期排定失败：" + e.message)
+        }
         try {
             CheckInScheduler.schedule(this)
         } catch (e: Exception) {
             Prefs.log(this, "服务重连时重排定时失败：" + e.message)
+        }
+        // 锁屏期间进程可能被省电策略杀掉，系统重连无障碍后主动消费待办。
+        // 这一步是关键：解锁广播可能早在 pending 写入前就发过了，不会再有第二次。
+        try {
+            PendingRunner.tryResume(this, "服务重连")
+        } catch (e: Exception) {
+            Prefs.log(this, "服务重连补执行失败：" + e.message)
         }
     }
 
@@ -237,6 +267,7 @@ class CheckInAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         unregisterUnlockRx()
         alive = null
+        setContentEvents(false)
         // 省电-4：销毁时清空所有残留 Runnable
         handler.removeCallbacksAndMessages(null)
         Prefs.log(this, "无障碍服务已断开")
@@ -258,6 +289,7 @@ class CheckInAccessibilityService : AccessibilityService() {
         if (running) {
             running = false
             testing = false
+            setContentEvents(false)
             handler.removeCallbacksAndMessages(null)
             Prefs.log(this, "服务被中断，终止当前打卡流程")
         }
@@ -265,14 +297,24 @@ class CheckInAccessibilityService : AccessibilityService() {
 
     /**
      * 被动检测入口：用户手动打卡必经企微打卡页。
-     * 省电-1：事件入口第一件事判断双时段完成，完成则零解析直接返回。
+     * 省电-1：非执行期第一件事判断双时段完成，完成则零解析直接返回。
      * 省电-2：限频 1800ms；事件源由 config 的 packageNames 限定为企微。
+     * 执行期改为事件驱动：页面一变化就立刻续跑，固定 TICK 只作兜底。
      */
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val e = event ?: return
-        if (Prefs.isDone(this, "上班") && Prefs.isDone(this, "下班")) return
         if (e.packageName?.toString() != WEWORK) return
-        if (running) return
+        if (running) {
+            // 点击后静默一小段，避免按钮的点击反馈事件把状态机推得过快；
+            // 再由最小 tick 间隔兜住企微 H5 的高频刷新事件。
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastActionAt < ACTION_QUIET_MS) return
+            if (now - lastTickAt < MIN_TICK_GAP_MS) return
+            handler.removeCallbacks(tickRunnable)
+            handler.postDelayed(tickRunnable, EVENT_TICK_DELAY)
+            return
+        }
+        if (Prefs.isDone(this, "上班") && Prefs.isDone(this, "下班")) return
         val now = SystemClock.elapsedRealtime()
         if (now - lastPassiveScan < 1800L) return
         lastPassiveScan = now
@@ -330,6 +372,8 @@ class CheckInAccessibilityService : AccessibilityService() {
         root.safeRecycle()
         if (!Prefs.isDone(this, s)) {
             Prefs.markDone(this, s)
+            // 手动打卡同样算一条打卡记录，和自动成功共用去重
+            SuccessNotifier.onSuccess(this, s)
             Prefs.log(this, "检测到手动打卡：今日$s 已完成（识别文案=$doneText 今日标识=${hasToday || hasNow}）")
         }
     }
@@ -347,9 +391,9 @@ class CheckInAccessibilityService : AccessibilityService() {
 
     fun begin(slotName: String, isTest: Boolean = false): Boolean {
         if (running) {
-            // watchdog：正常流程最长 ~55s 必然 finish，超过 120s 还挂着说明异常中断了，
+            // watchdog：正常流程最长 45s 必然 finish，超过 60s 还挂着说明异常中断了，
             // 强制重置，否则「立即测试」会被永久锁死
-            if (SystemClock.elapsedRealtime() - beginAt > 120_000L) {
+            if (SystemClock.elapsedRealtime() - beginAt > 60_000L) {
                 Prefs.log(this, "上一次流程超时未结束，强制重置后重新开始")
                 handler.removeCallbacksAndMessages(null)
                 running = false
@@ -373,7 +417,17 @@ class CheckInAccessibilityService : AccessibilityService() {
         lastPunchTick = 0
         confirmTick = -1
         wentWorkbench = false
+        lastTickAt = 0L
+        lastActionAt = SystemClock.elapsedRealtime()
+        lastEntryAt = 0L
+        lastPunchAt = 0L
+        lastScrollAt = 0L
+        confirmAt = 0L
         slot = slotName
+
+        // 只在执行的这十几秒里开启内容变化事件，页面内按钮一出现就能立刻续跑；
+        // finish 时一定还原，平时仍是原来的最小事件面。
+        setContentEvents(true)
 
         Prefs.log(this, (if (isTest) "[测试] 开始自动打卡：" else "开始自动打卡：") + slot)
 
@@ -389,14 +443,44 @@ class CheckInAccessibilityService : AccessibilityService() {
             finish(false, "启动企业微信失败：" + e.message)
             return false
         }
-        handler.postDelayed(tickRunnable, 1800)
+        handler.postDelayed(tickRunnable, FIRST_DELAY)
         return true
+    }
+
+    /**
+     * 动态增删 TYPE_WINDOW_CONTENT_CHANGED。企微打卡页是 H5，按钮出现时不一定伴随
+     * 窗口状态变化；执行期加上它才能做到「页面就绪即点」。流程结束立刻还原，
+     * 空闲时不会额外收到任何事件，保持省电。
+     */
+    private fun setContentEvents(on: Boolean) {
+        if (contentEventsOn == on) return
+        try {
+            val info = serviceInfo ?: return
+            val base = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
+                    AccessibilityEvent.TYPE_VIEW_CLICKED or
+                    AccessibilityEvent.TYPE_VIEW_FOCUSED or
+                    AccessibilityEvent.TYPE_VIEW_SCROLLED
+            info.eventTypes = if (on) base or AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED else base
+            serviceInfo = info
+            contentEventsOn = on
+        } catch (e: Exception) {
+            Prefs.log(this, "调整事件监听失败：" + e.message)
+        }
     }
 
     private fun tick() {
         if (!running) return
+        val nowRt = SystemClock.elapsedRealtime()
+        // 刚点过 / 刚滑过：给页面一点渲染时间，不立刻重复扫同一帧
+        val quietLeft = ACTION_QUIET_MS - (nowRt - lastActionAt)
+        if (quietLeft > 0L) {
+            handler.removeCallbacks(tickRunnable)
+            handler.postDelayed(tickRunnable, quietLeft)
+            return
+        }
+        lastTickAt = nowRt
         ticks++
-        if (ticks > MAX_TICK) {
+        if (ticks > MAX_TICK || nowRt - beginAt > MAX_RUN_MS) {
             // Bug-9：超时时 dump 页面上含「打卡」的候选文本 + 顶栏节点，便于排查匹配失败原因
             val root = rootInActiveWindow
             val dump = if (root != null && root.packageName?.toString() == WEWORK) {
@@ -425,7 +509,7 @@ class CheckInAccessibilityService : AccessibilityService() {
             // 已经点过打卡按钮，企微却不在前台：多半是打卡后页面收起、手机息屏或跳去拍照页。
             // 不能一路空转到超时判「未完成」，否则就是「打完了还催补卡」。
             // 这里没走到「确认打卡」，留一条中性提醒（不带补卡字样）防止真需要拍照时漏卡。
-            if (punchClicks > 0 && ticks - lastPunchTick >= 3) {
+            if (punchClicks > 0 && nowRt - lastPunchAt >= SETTLE_MS) {
                 finishSubmitted(
                     "已点打卡按钮（$slot），企微页面已收起，结果以企微为准",
                     remind = true
@@ -449,11 +533,16 @@ class CheckInAccessibilityService : AccessibilityService() {
                 if (btn == null) continue
                 punchClicks++
                 lastPunchTick = ticks
-                if (label == "确认打卡") confirmTick = ticks
+                lastPunchAt = SystemClock.elapsedRealtime()
+                lastActionAt = lastPunchAt
+                if (label == "确认打卡") {
+                    confirmTick = ticks
+                    confirmAt = lastPunchAt
+                }
                 Prefs.log(this, "点击打卡按钮（$label，第 $punchClicks 次）")
                 clickNode(btn)
                 root.safeRecycle()
-                handler.postDelayed(tickRunnable, if (punchClicks == 1) 2600 else 2000)
+                handler.postDelayed(tickRunnable, if (punchClicks == 1) AFTER_PUNCH_1 else AFTER_PUNCH_N)
                 return
             }
         }
@@ -468,8 +557,8 @@ class CheckInAccessibilityService : AccessibilityService() {
             return
         }
 
-        // 点完按钮至少等 3 轮看结果，别急着切去点「···」
-        val punchSettled = punchClicks == 0 || ticks - lastPunchTick >= 3
+        // 点完按钮至少等 1.5 秒看结果，别急着切去点「···」
+        val punchSettled = punchClicks == 0 || nowRt - lastPunchAt >= SETTLE_MS
 
         // 1) 菜单里的「进入应用」（预览页点开「···」后出现；有的版本直接给按钮）
         if (punchSettled && enterClicks < MAX_ENTER) {
@@ -477,36 +566,39 @@ class CheckInAccessibilityService : AccessibilityService() {
                 val n = clickTarget(root, listOf(label))
                 if (n == null) continue
                 enterClicks++
+                lastActionAt = SystemClock.elapsedRealtime()
                 Prefs.log(this, "点击「$label」进入打卡应用")
                 clickNode(n)
                 enteredApp = true
                 root.safeRecycle()
-                handler.postDelayed(tickRunnable, 2800)
+                handler.postDelayed(tickRunnable, AFTER_ENTER)
                 return
             }
         }
 
-        // 2) 右上角「···」。必须等入口点过、且至少两轮（给预览页加载时间），
+        // 2) 右上角「···」。必须等入口点过、且页面至少渲染了 0.9 秒，
         //    否则会在企微首页乱点顶栏的其它按钮。
-        val loadedTick = lastEntryTick > 0 && ticks - lastEntryTick >= 2
+        val loadedTick = lastEntryAt > 0 && nowRt - lastEntryAt >= ENTRY_LOAD_MS
         if (punchSettled && dotsClicks < MAX_DOTS && loadedTick) {
             val dots = findMoreButton(root)
             if (dots != null) {
                 dotsClicks++
+                lastActionAt = SystemClock.elapsedRealtime()
                 Prefs.log(this, "点击右上角「更多」，展开应用菜单")
                 val ok = clickNode(dots)
                 if (!ok) tapTopRightMore(root)
                 root.safeRecycle()
-                handler.postDelayed(tickRunnable, 2200)
+                handler.postDelayed(tickRunnable, AFTER_DOTS)
                 return
             }
             // 节点里摸不到（H5 自绘/胶囊按钮未暴露）：退化为手势点右上角区域
-            if (dotsClicks == 0 && ticks - lastEntryTick >= 3) {
+            if (dotsClicks == 0 && nowRt - lastEntryAt >= ENTRY_LOAD_MS + 600L) {
                 dotsClicks++
+                lastActionAt = SystemClock.elapsedRealtime()
                 Prefs.log(this, "未识别到「更多」节点，改用点击右上角区域")
                 tapTopRightMore(root)
                 root.safeRecycle()
-                handler.postDelayed(tickRunnable, 2200)
+                handler.postDelayed(tickRunnable, AFTER_DOTS)
                 return
             }
         }
@@ -515,11 +607,12 @@ class CheckInAccessibilityService : AccessibilityService() {
         if (!wentWorkbench) {
             val tab = clickTarget(root, listOf("工作台"))
             if (tab != null) {
+                lastActionAt = SystemClock.elapsedRealtime()
                 Prefs.log(this, "切换到工作台")
                 clickNode(tab)
                 wentWorkbench = true
                 root.safeRecycle()
-                handler.postDelayed(tickRunnable, 1600)
+                handler.postDelayed(tickRunnable, AFTER_TAB)
                 return
             }
         }
@@ -531,22 +624,28 @@ class CheckInAccessibilityService : AccessibilityService() {
                 if (n == null) continue
                 entryClicks++
                 lastEntryTick = ticks
+                lastEntryAt = SystemClock.elapsedRealtime()
+                lastActionAt = lastEntryAt
                 Prefs.log(this, "点击打卡入口（$label，第 $entryClicks 次）")
                 clickNode(n)
                 root.safeRecycle()
-                handler.postDelayed(tickRunnable, 2600)
+                handler.postDelayed(tickRunnable, AFTER_ENTRY)
                 return
             }
         }
 
         // 5) 首屏没看到打卡入口：向下翻页再找（实测企微工作台的打卡应用经常在第二屏之后）
-        if (entryClicks == 0 && wentWorkbench && scrolls < MAX_SCROLLS && ticks - lastScrollTick >= 2) {
+        if (entryClicks == 0 && wentWorkbench && scrolls < MAX_SCROLLS &&
+            nowRt - lastScrollAt >= 700L
+        ) {
             if (scrollWorkbench(root)) {
                 scrolls++
                 lastScrollTick = ticks
+                lastScrollAt = SystemClock.elapsedRealtime()
+                lastActionAt = lastScrollAt
                 Prefs.log(this, "工作台未见打卡入口，向下翻第 $scrolls 页")
                 root.safeRecycle()
-                handler.postDelayed(tickRunnable, 1700)
+                handler.postDelayed(tickRunnable, AFTER_SCROLL)
                 return
             }
         }
@@ -594,7 +693,9 @@ class CheckInAccessibilityService : AccessibilityService() {
             return
         }
 
-        if (ticks - confirmTick >= CONFIRM_WAIT_TICKS) {
+        if (SystemClock.elapsedRealtime() - confirmAt >= CONFIRM_WAIT_MS ||
+            ticks - confirmTick >= CONFIRM_WAIT_TICKS
+        ) {
             finishSubmitted("已提交「确认打卡」，未读到完成文案，结果请在企微确认")
             return
         }
@@ -660,11 +761,16 @@ class CheckInAccessibilityService : AccessibilityService() {
                 val btn = clickTarget(root, listOf(label))
                 if (btn == null) continue
                 punchClicks++
-                if (label == "确认打卡") confirmTick = ticks
+                lastPunchAt = SystemClock.elapsedRealtime()
+                lastActionAt = lastPunchAt
+                if (label == "确认打卡") {
+                    confirmTick = ticks
+                    confirmAt = lastPunchAt
+                }
                 Prefs.log(this, "点击打卡按钮（$label，第 $punchClicks 次）")
                 clickNode(btn)
                 root.safeRecycle()
-                handler.postDelayed(tickRunnable, if (punchClicks == 1) 2600 else 2000)
+                handler.postDelayed(tickRunnable, if (punchClicks == 1) AFTER_PUNCH_1 else AFTER_PUNCH_N)
                 return
             }
         }
@@ -809,6 +915,8 @@ class CheckInAccessibilityService : AccessibilityService() {
         val wasTest = testing
         running = false
         testing = false
+        setContentEvents(false)
+        CheckInScheduler.cancelResume(this)
         // 省电-4：成功/失败/超时所有分支统一清理 Handler，杜绝残留 Runnable
         handler.removeCallbacksAndMessages(null)
 
@@ -819,9 +927,15 @@ class CheckInAccessibilityService : AccessibilityService() {
         if (!wasTest) Prefs.clearPending(this)
 
         if (ok) {
-            if (!wasTest) Prefs.markDone(this, slot)
+            if (!wasTest) {
+                Prefs.markDone(this, slot)
+                // 唯一一条「打卡成功」通知，按日期+时段去重；
+                // 原先的「打卡完成」提醒由此替换，避免同一次打卡弹两条。
+                SuccessNotifier.onSuccess(this, slot)
+            } else {
+                Notifier.alert(this, prefix + "打卡完成（" + slot + "）", msg)
+            }
             Prefs.log(this, prefix + "完成：" + msg)
-            Notifier.alert(this, prefix + "打卡完成（" + slot + "）", msg)
         } else {
             // 兜底：流程判失败但完成状态其实已经写入（用户手动打过、被动检测刚标上），
             // 就别再弹「请手动补一下」了，否则会出现「已经打卡成功还被催补卡」的误报。
@@ -843,6 +957,8 @@ class CheckInAccessibilityService : AccessibilityService() {
         val wasTest = testing
         running = false
         testing = false
+        setContentEvents(false)
+        CheckInScheduler.cancelResume(this)
         handler.removeCallbacksAndMessages(null)
         val prefix = if (wasTest) "[测试] " else ""
         if (!wasTest) {

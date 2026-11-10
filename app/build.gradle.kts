@@ -1,6 +1,17 @@
+import java.io.FileInputStream
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+}
+
+// release 签名凭据只从本地 keystore.properties 读取（该文件不入库）。
+// 没有这个文件时仍能正常打 debug 包，release 包则为未签名状态。
+val ksPropsFile = rootProject.file("keystore.properties")
+val ksProps = Properties()
+if (ksPropsFile.exists()) {
+    FileInputStream(ksPropsFile).use { ksProps.load(it) }
 }
 
 android {
@@ -16,8 +27,22 @@ android {
         versionName = "1.0"
     }
 
+    signingConfigs {
+        if (ksProps.getProperty("storeFile") != null) {
+            create("release") {
+                storeFile = rootProject.file(ksProps.getProperty("storeFile"))
+                storePassword = ksProps.getProperty("storePassword")
+                keyAlias = ksProps.getProperty("keyAlias")
+                keyPassword = ksProps.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
+            signingConfig = signingConfigs.findByName("release")
+            // 无障碍服务类名写在 Manifest 里，且流程靠界面文案匹配，
+            // 不做代码混淆，避免反射/类名变化引入难以排查的问题。
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

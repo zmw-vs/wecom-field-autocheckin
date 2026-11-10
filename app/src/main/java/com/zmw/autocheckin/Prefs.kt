@@ -26,6 +26,16 @@ object Prefs {
     private const val K_PENDING = "pending"
     private const val K_PENDING_SLOT = "pending_slot"
     private const val K_PENDING_AT = "pending_at"
+    private const val K_NEXT_DUE_AT = "next_due_at"
+    private const val K_NEXT_DUE_SLOT = "next_due_slot"
+    private const val K_SUCCESS_NOTIFIED = "success_notified"
+    private const val K_STATUS_ENABLED = "status_push_enabled"
+    private const val K_STATUS_MINUTES = "status_push_minutes"
+    private const val K_STATUS_API = "status_api_url"
+    private const val K_STATUS_TOKEN = "status_api_token"
+    private const val K_STATUS_USER = "status_user_id"
+    private const val K_STATUS_LAST_DATE = "status_last_date"
+    private const val K_STATUS_LAST_RESULT = "status_last_result"
     private const val K_DONE_UP = "done_up_date"
     private const val K_DONE_DOWN = "done_down_date"
     private const val K_LOGS = "logs"
@@ -140,6 +150,117 @@ object Prefs {
 
     fun autoClick(ctx: Context): Boolean = sp(ctx).getBoolean(K_AUTO, true)
     fun setAutoClick(ctx: Context, v: Boolean) = sp(ctx).edit().putBoolean(K_AUTO, v).apply()
+
+    /**
+     * 下一次闹钟的排定时刻与时段。
+     * RTC 是非唤醒闹钟，设备休眠时会顺延到唤醒才送达；送达时刻可能跨天、跨到非工作日，
+     * 若按「送达时刻」重算工作日/时段，就会漏卡或打错时段。存下排定信息供 AlarmReceiver 使用。
+     */
+    data class NextDue(val at: Long, val slot: String)
+
+    fun nextDue(ctx: Context): NextDue? {
+        val at = sp(ctx).getLong(K_NEXT_DUE_AT, 0L)
+        if (at <= 0L) return null
+        val slot = sp(ctx).getString(K_NEXT_DUE_SLOT, "") ?: ""
+        return if (slot.isEmpty()) null else NextDue(at, slot)
+    }
+
+    fun setNextDue(ctx: Context, at: Long, slot: String) =
+        sp(ctx).edit().putLong(K_NEXT_DUE_AT, at).putString(K_NEXT_DUE_SLOT, slot).apply()
+
+    fun clearNextDue(ctx: Context) =
+        sp(ctx).edit().remove(K_NEXT_DUE_AT).remove(K_NEXT_DUE_SLOT).apply()
+
+    /** 派发去重：服务重连与顺延闹钟可能同时到达，同一时段 5 分钟内只派发一次 */
+    private const val K_LAST_DISPATCH_AT = "last_dispatch_at"
+    private const val K_LAST_DISPATCH_SLOT = "last_dispatch_slot"
+    private const val DISPATCH_DEDUP_MS = 5 * 60 * 1000L
+
+    fun skipDispatch(ctx: Context, slot: String): Boolean {
+        val at = sp(ctx).getLong(K_LAST_DISPATCH_AT, 0L)
+        val s = sp(ctx).getString(K_LAST_DISPATCH_SLOT, "") ?: ""
+        return s == slot && System.currentTimeMillis() - at < DISPATCH_DEDUP_MS
+    }
+
+    fun markDispatch(ctx: Context, slot: String) =
+        sp(ctx).edit().putLong(K_LAST_DISPATCH_AT, System.currentTimeMillis())
+            .putString(K_LAST_DISPATCH_SLOT, slot).apply()
+
+    // ---------------- 打卡成功通知去重 ----------------
+
+    /**
+     * 同一条打卡记录只推一次：键 = 本地日期 + 时段，与 isDone 的日期口径一致。
+     * 每次写入顺手清掉非今天的键，集合不会随时间无限增长。
+     * @return true 表示本次是首次，调用方应当推送通知
+     */
+    fun markSuccessNotified(ctx: Context, slot: String): Boolean {
+        val prefix = today() + "|"
+        val key = prefix + slot
+        val set = HashSet(sp(ctx).getStringSet(K_SUCCESS_NOTIFIED, null) ?: emptySet())
+        set.removeAll { !it.startsWith(prefix) }
+        if (set.contains(key)) return false
+        set.add(key)
+        sp(ctx).edit().putStringSet(K_SUCCESS_NOTIFIED, set).apply()
+        return true
+    }
+
+    // ---------------- 每日打卡状态推送 ----------------
+
+    /** 用户级开关，默认关闭；与「启用定时任务」相互独立 */
+    const val DEFAULT_STATUS_API = "https://qyapi.weixin.qq.com/cgi-bin/checkin/getcheckindata"
+    const val DEFAULT_STATUS_MINUTES = 20 * 60
+
+    fun statusPushEnabled(ctx: Context): Boolean = sp(ctx).getBoolean(K_STATUS_ENABLED, false)
+    fun setStatusPushEnabled(ctx: Context, v: Boolean) =
+        sp(ctx).edit().putBoolean(K_STATUS_ENABLED, v).apply()
+
+    fun statusPushMinutes(ctx: Context): Int =
+        sp(ctx).getInt(K_STATUS_MINUTES, DEFAULT_STATUS_MINUTES)
+    fun setStatusPushMinutes(ctx: Context, m: Int) =
+        sp(ctx).edit().putInt(K_STATUS_MINUTES, m).apply()
+
+    fun statusApiUrl(ctx: Context): String =
+        sp(ctx).getString(K_STATUS_API, DEFAULT_STATUS_API)?.ifBlank { DEFAULT_STATUS_API }
+            ?: DEFAULT_STATUS_API
+    fun setStatusApiUrl(ctx: Context, v: String) =
+        sp(ctx).edit().putString(K_STATUS_API, v.trim()).apply()
+    fun resetStatusApiUrl(ctx: Context) = sp(ctx).edit().remove(K_STATUS_API).apply()
+
+    fun statusApiToken(ctx: Context): String = sp(ctx).getString(K_STATUS_TOKEN, "") ?: ""
+    fun setStatusApiToken(ctx: Context, v: String) =
+        sp(ctx).edit().putString(K_STATUS_TOKEN, v.trim()).apply()
+
+    fun statusUserId(ctx: Context): String = sp(ctx).getString(K_STATUS_USER, "") ?: ""
+    fun setStatusUserId(ctx: Context, v: String) =
+        sp(ctx).edit().putString(K_STATUS_USER, v.trim()).apply()
+
+    /** 配置自检：URL 里已带 access_token 时不再要求单独填 token */
+    fun statusConfigProblem(ctx: Context): String? {
+        val url = statusApiUrl(ctx)
+        if (url.isBlank()) return "未配置查询接口地址"
+        val hasTokenInUrl = url.contains("access_token=", ignoreCase = true)
+        if (!hasTokenInUrl && statusApiToken(ctx).isBlank()) return "缺少 access_token"
+        if (statusUserId(ctx).isBlank()) return "缺少用户 ID（userid）"
+        return null
+    }
+
+    /** 配置齐全才走真实 API；否则用本机记录，不假装查过企业微信 */
+    fun statusUseApi(ctx: Context): Boolean = statusConfigProblem(ctx) == null
+
+    /** 定时推送同日只推一次，避免 RTC 顺延 + 服务重连造成重复通知 */
+    fun statusPushedToday(ctx: Context): Boolean =
+        sp(ctx).getString(K_STATUS_LAST_DATE, "") == today()
+
+    fun markStatusPushed(ctx: Context, result: String) =
+        sp(ctx).edit()
+            .putString(K_STATUS_LAST_DATE, today())
+            .putString(
+                K_STATUS_LAST_RESULT,
+                SimpleDateFormat("MM-dd HH:mm:ss", Locale.US).format(Date()) + "  " + result
+            )
+            .apply()
+
+    fun statusLastResult(ctx: Context): String = sp(ctx).getString(K_STATUS_LAST_RESULT, "") ?: ""
 
     /** 锁屏待办有效期：超过即丢弃，防止跨天残留导致第二天错误补打卡 */
     const val PENDING_STALE_MS = 2 * 60 * 60 * 1000L

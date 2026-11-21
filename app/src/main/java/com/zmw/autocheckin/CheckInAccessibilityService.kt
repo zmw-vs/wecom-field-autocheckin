@@ -75,13 +75,46 @@ class CheckInAccessibilityService : AccessibilityService() {
         private val DONE_TEXTS = listOf("打卡成功", "已打卡", "更新打卡")
 
         /**
-         * 点过「确认打卡」之后用来判成功的文案，比 DONE_TEXTS 宽。
-         * 外勤确认完企微不一定弹「打卡成功」四个字，也可能直接显示打卡时间/已打卡栏位。
-         * 只用于确认后的收尾判定，不影响 passiveScan 和「当前已是打卡状态」的严格判定。
+         * 「明确打卡成功」的文案，只保留即时反馈类：
+         * 「打卡成功 / 打卡完成」是企微打完立刻弹的，「更新打卡」是成功后才出现的按钮。
+         *
+         * 绝不能把「打卡时间」这类页面静态标签算成功——打卡页一直挂着这项，
+         * 定位弱、压根没打上时它也在，正是「没打成却报成功」的根源。
          */
-        private val SUCCESS_TEXTS = listOf(
-            "打卡成功", "已打卡", "更新打卡", "打卡完成", "今日已打卡", "打卡时间"
+        private val STRONG_SUCCESS_TEXTS = listOf("打卡成功", "打卡完成", "更新打卡")
+
+        /**
+         * 弱证据：「已打卡 / 今日已打卡」在另一时段已打完、或历史记录页都会出现，
+         * 单看它会把「上班已打卡」误当成本次「下班打卡」成功。
+         * 只在本时段栏位旁边出现时才采信（见 slotAlreadyDone）。
+         */
+        private val WEAK_SUCCESS_TEXTS = listOf("已打卡", "今日已打卡", "打卡时间")
+
+        /**
+         * 打卡受阻：定位弱/无定位/网络差时企微会在打卡处显示这类文案，
+         * 此时按钮点了也不会成功，必须判「未成功」，不能判成功。
+         */
+        private val BLOCKED_TEXTS = listOf(
+            "定位失败", "无法定位", "定位异常", "定位不准", "定位精度低", "定位精度较低",
+            "无法获取位置", "位置获取失败", "位置信息获取失败",
+            "信号弱", "网络异常", "网络不给力", "请检查网络", "当前网络不可用"
         )
+
+        /** 正在定位：既不是成功也不是失败，继续等，别急着下结论 */
+        private val LOCATING_TEXTS = listOf("定位中", "正在定位", "正在获取定位", "获取定位中")
+
+        /** 点完打卡按钮后，等这么久还没有明确结果就中性收尾，既不误报也不催补卡 */
+        private const val PUNCH_VERDICT_MS = 4000L
+
+        /** 企微停在内页（聊天/文档/邮件/设置）时按返回退回主界面，最多几次 */
+        private const val MAX_BACK = 5
+        private const val AFTER_BACK = 800L
+        private const val MAX_RELAUNCH = 2
+
+        /** completionState 结果 */
+        private const val ST_NONE = 0
+        private const val ST_DONE = 1
+        private const val ST_BLOCKED = 2
 
         /** 点完「确认打卡」最多再等 2.5 秒，够企微刷新结果，又不至于空转耗电 */
         private const val CONFIRM_WAIT_MS = 2500L
@@ -183,6 +216,18 @@ class CheckInAccessibilityService : AccessibilityService() {
     /** 工作台翻页次数与上次翻页轮次 */
     private var scrolls = 0
     private var lastScrollTick = 0
+
+    /**
+     * 企微被用户停在聊天/文档/邮件等内页时，底部标签栏不可见，够不到「工作台」。
+     * 这里靠「按返回退回主界面」+「必要时重新拉起」两条兜底，不再是空转到超时。
+     */
+    private var backs = 0
+    private var relaunches = 0
+    private var lastBackAt = 0L
+    private var lastRelaunchAt = 0L
+
+    /** 点完打卡按钮、还没拿到明确结论时，用于「中性收尾」的超时基准 */
+    private var awaitingVerdict = false
 
     /** 上一次点击打卡按钮的轮次：点完迟迟没结果才去走「··· → 进入应用」 */
     private var lastPunchTick = 0
@@ -389,6 +434,172 @@ class CheckInAccessibilityService : AccessibilityService() {
         return null
     }
 
+    /** 返回第一个命中的文案，用于日志里说明到底是被哪条拦下的 */
+    private fun firstMatch(root: AccessibilityNodeInfo, texts: List<String>): String? {
+        for (t in texts) {
+            if (exists(root, listOf(t))) return t
+        }
+        return null
+    }
+
+    /**
+     * 判断当前页面上的完成/受阻状态。
+     *
+     * 返回 ST_BLOCKED 时一定不是成功：定位弱/没定位/网络异常时企微会在打卡处显示提示，
+     * 按钮点了也不会成功。之前把「打卡时间」当成功文案，这类场景直接误报成功。
+     *
+     * 返回 ST_DONE 需要证据，且证据分强弱：
+     *   - STRONG：打卡成功/打卡完成/更新打卡，是打完才出现的即时反馈；
+     *   - WEAK：已打卡/今日已打卡/打卡时间，打卡页常驻或另一时段已打也会出现，
+     *     必须确认它落在**本时段**栏位附近才采信，避免「上班已打卡」骗过下班卡判定。
+     */
+    private fun completionState(root: AccessibilityNodeInfo): Int {
+        // 受阻判定必须让位于「还能点」：
+        // 打卡页在未打卡时也可能挂着「定位中/信号弱」之类的说明性文案，
+        // 若不加限制，会在按钮明明可点的情况下直接判失败，等于把能打的卡放弃了。
+        // 所以只有「点过按钮后仍受阻」或「压根没有可点按钮」时，才认为是真受阻。
+        val blocked = firstMatch(root, BLOCKED_TEXTS)
+        if (blocked != null) {
+            val loc = firstMatch(root, LOCATING_TEXTS)
+            if (loc != null && punchClicks == 0) {
+                // 正在定位：再等等，别急着下结论也不急着点
+                return ST_NONE
+            }
+            val canStillPunch = punchClicks < MAX_PUNCH &&
+                clickTarget(root, listOf("确认打卡", slot + "打卡", "外出打卡"))
+                    .also { it.safeRecycle() } != null
+            if (!canStillPunch) return ST_BLOCKED
+            // 按钮还在就先点，点完再看是否仍然受阻
+            return ST_NONE
+        }
+
+        // 还没点过任何打卡按钮：只有「打卡成功/打卡完成」这类即时文案才算数，
+        // 而且此时能看到它基本是上一次刚打完的残留，交给上层做「当前已是打卡状态」。
+        // 弱证据（已打卡/打卡时间）在这里一律不采信 —— 打卡页的「上班打卡」按钮
+        // 和「打卡时间」标签常常并排显示，按位置匹配会把「还没打」误判成「已打」，
+        // 结果就是该打的卡被跳过，这是比误报成功更严重的错。
+        if (punchClicks == 0) {
+            return if (firstMatch(root, STRONG_SUCCESS_TEXTS) != null) ST_DONE else ST_NONE
+        }
+
+        // 点过按钮后：明确成功文案直接算成功
+        if (firstMatch(root, STRONG_SUCCESS_TEXTS) != null) return ST_DONE
+
+        // 弱证据必须绑定到本时段栏位才采信，避免「上班已打卡」骗过下班卡判定
+        val weak = firstMatch(root, WEAK_SUCCESS_TEXTS) ?: return ST_NONE
+        if (slotAlreadyDone(root)) {
+            Prefs.log(this, "点过按钮后本时段栏位旁出现「$weak」，判定本时段已完成")
+            return ST_DONE
+        }
+        return ST_NONE
+    }
+
+    /**
+     * 「已打卡」是否属于**本时段**（slot）。
+     * 打卡页左右/上下两个栏位各自显示状态，先定位本时段栏位的坐标，
+     * 再看「已打卡」是否落在同一行附近。太宽松就会把上班已打卡当成本次下班成功。
+     */
+    private fun slotAlreadyDone(root: AccessibilityNodeInfo): Boolean {
+        val slotRect = firstNodeRect(root, slot) ?: return false
+        var hit = false
+        for (t in WEAK_SUCCESS_TEXTS) {
+            for (n in safeFindByText(root, t)) {
+                if (!hit) {
+                    val r = Rect()
+                    n.getBoundsInScreen(r)
+                    // 同一栏位：垂直中心相差不超过 1.6 倍行高，且水平范围有重叠
+                    val dy = Math.abs(r.centerY() - slotRect.centerY())
+                    val sameRow = dy <= maxOf(r.height(), slotRect.height(), dp(40)) * 1.6f
+                    val overlapX = r.left < slotRect.right && slotRect.left < r.right
+                    if (sameRow && overlapX) hit = true
+                }
+                n.safeRecycle()
+            }
+        }
+        return hit
+    }
+
+    private fun firstNodeRect(root: AccessibilityNodeInfo, text: String): Rect? {
+        val list = safeFindByText(root, text)
+        var best: Rect? = null
+        for (n in list) {
+            val label = (n.text?.toString() ?: n.contentDescription?.toString() ?: "").trim()
+            if (label == text || label.startsWith(text)) {
+                val r = Rect()
+                n.getBoundsInScreen(r)
+                if (r.width() > 0 && r.height() > 0) {
+                    // 取最靠上的那个（打卡页栏位标题通常是第一个）
+                    if (best == null || r.top < best.top) best = Rect(r)
+                }
+            }
+            n.safeRecycle()
+        }
+        return best
+    }
+
+    private fun safeFindByText(
+        root: AccessibilityNodeInfo,
+        text: String
+    ): List<AccessibilityNodeInfo> = try {
+        root.findAccessibilityNodeInfosByText(text) ?: emptyList()
+    } catch (_: Exception) {
+        emptyList()
+    }
+
+    /**
+     * 当前是否站在「能找到打卡入口」的界面。
+     *
+     * 只认企微**底部标签栏**里的那几项（消息/邮件/文档/工作台/通讯录/我）。
+     * 注意不能把「文档」「邮件」「日程」单独当主界面标志——用户很可能正停在
+     * 某个文档或邮件的详情页里，那些页面上也有同名文字，会误判成主界面而不再退back。
+     *
+     * 判据：标签栏项在屏幕底部区域，且同屏出现 ≥2 项。单个「消息」可能是聊天页标题，
+     * 所以要求成组出现。
+     */
+    private fun atNavigableSurface(root: AccessibilityNodeInfo): Boolean {
+        // 已经在打卡页/预览页/确认弹窗上：别按返回，否则会把要点的界面关掉
+        if (punchClicks > 0) return true
+        if (enteredApp) return true
+        if (exists(root, listOf("确认打卡"))) return true
+        if (exists(root, listOf("上班打卡", "下班打卡", "外出打卡"))) return true
+        if (exists(root, listOf("进入应用", "打开应用", "进入小程序", "打开小程序"))) return true
+        if (exists(root, listOf("进入应用", "立即进入"))) return true
+
+        // 底部标签栏：仅统计落在屏幕下方 20% 内的标签文字
+        val win = windowBounds(root)
+        val bottomTop = win.top + (win.height() * 0.80f).toInt()
+        val tabNames = listOf("消息", "邮件", "文档", "工作台", "通讯录", "我")
+        var hits = 0
+        for (t in tabNames) {
+            val list = safeFindByText(root, t)
+            var matched = false
+            for (n in list) {
+                val label = (n.text?.toString() ?: n.contentDescription?.toString() ?: "").trim()
+                if (label == t) {
+                    val r = Rect()
+                    n.getBoundsInScreen(r)
+                    if (r.height() > 0 && r.centerY() >= bottomTop) matched = true
+                }
+                n.safeRecycle()
+            }
+            if (matched) hits++
+        }
+        // 成组出现才认（单个可能是正文里的字），≥2 项足以排除详情页
+        return hits >= 2
+    }
+
+    /**
+     * 视觉上是否明显是企微的「内页」（聊天会话、文档正文、邮件详情等）。
+     * 只用于日志和「要不要退」的判断依据；不含设置页这类容易与主界面混淆的特征。
+     */
+    private fun looksInnerPage(root: AccessibilityNodeInfo): Boolean {
+        // 聊天会话页特征
+        if (exists(root, listOf("发送消息", "发送给", "输入消息"))) return true
+        // 文档/邮件/日程详情
+        if (exists(root, listOf("相关讨论", "分享给同事", "添加到日程"))) return true
+        return false
+    }
+
     fun begin(slotName: String, isTest: Boolean = false): Boolean {
         if (running) {
             // watchdog：正常流程最长 45s 必然 finish，超过 60s 还挂着说明异常中断了，
@@ -414,6 +625,11 @@ class CheckInAccessibilityService : AccessibilityService() {
         lastEntryTick = 0
         scrolls = 0
         lastScrollTick = 0
+        backs = 0
+        relaunches = 0
+        lastBackAt = 0L
+        lastRelaunchAt = 0L
+        awaitingVerdict = false
         lastPunchTick = 0
         confirmTick = -1
         wentWorkbench = false
@@ -430,21 +646,39 @@ class CheckInAccessibilityService : AccessibilityService() {
         setContentEvents(true)
 
         Prefs.log(this, (if (isTest) "[测试] 开始自动打卡：" else "开始自动打卡：") + slot)
+        launchWework()
+        handler.postDelayed(tickRunnable, FIRST_DELAY)
+        return true
+    }
 
+    /**
+     * 把企微拉到前台。
+     *
+     * 关键：企微已经打开过、停在内页（聊天/文档/邮件）时，单靠 launch intent +
+     * RESET_TASK_IF_NEEDED 是「恢复原样」，仍然停在那个内页，底部标签栏看不见，
+     * 就永远点不到「工作台」——这正是「打开过企微后程序卡住不动」的直接原因。
+     *
+     * 用 CLEAR_TOP | SINGLE_TOP 让它在已有任务栈上回到根 Activity（主界面），
+     * 标签栏就回来了。仍然失败的话，tick 里还有「按返回」兜底。
+     */
+    private fun launchWework(): Boolean {
         val launch = packageManager.getLaunchIntentForPackage(WEWORK)
         if (launch == null) {
             finish(false, "未安装企业微信")
             return false
         }
-        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
-        try {
+        launch.addFlags(
+            Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                Intent.FLAG_ACTIVITY_SINGLE_TOP
+        )
+        return try {
             startActivity(launch)
+            true
         } catch (e: Exception) {
             finish(false, "启动企业微信失败：" + e.message)
-            return false
+            false
         }
-        handler.postDelayed(tickRunnable, FIRST_DELAY)
-        return true
     }
 
     /**
@@ -526,6 +760,40 @@ class CheckInAccessibilityService : AccessibilityService() {
         // 所以不能靠「看到上班打卡就算进了应用」切阶段（预览页也会显示这个文案），
         // 改成按预算并行尝试：先直接点按钮，点不动再走「···」链路。
 
+        // 0) 先确认自己站在能找到打卡入口的地方。
+        //    企微被打开过、停在聊天/文档/邮件等内页时，底部标签栏不可见，
+        //    下面所有「工作台 / 打卡」的匹配都会落空，只能空转到超时。
+        //    这里主动把界面退回主界面：先按返回，返回无效再重新拉起（带 CLEAR_TOP）。
+        if (!atNavigableSurface(root)) {
+            if (punchClicks == 0 && nowRt - lastBackAt >= AFTER_BACK) {
+                val inner = looksInnerPage(root)
+                // 明确是内页才按返回；判不出来时也允许退（可能是 H5 覆盖），
+                // 但次数受限，且每次都会因为页面变化而重新判定，不会一路退到桌面。
+                if (backs < MAX_BACK) {
+                    backs++
+                    lastBackAt = nowRt
+                    lastActionAt = nowRt
+                    Prefs.log(this, "企微不在可导航界面（内页=" + inner + "），按返回退回主界面（第 $backs 次）")
+                    performGlobalAction(GLOBAL_ACTION_BACK)
+                    root.safeRecycle()
+                    handler.postDelayed(tickRunnable, AFTER_BACK)
+                    return
+                }
+                // 返回压不住（可能在深层页面或被弹窗拦着）：重新拉起一次，回到根界面
+                if (relaunches < MAX_RELAUNCH && nowRt - lastRelaunchAt >= 1500L) {
+                    relaunches++
+                    lastRelaunchAt = nowRt
+                    lastActionAt = nowRt
+                    backs = 0
+                    Prefs.log(this, "返回无法回主界面，重新拉起企微（第 $relaunches 次）")
+                    root.safeRecycle()
+                    if (!launchWework()) return
+                    handler.postDelayed(tickRunnable, AFTER_ENTRY)
+                    return
+                }
+            }
+        }
+
         // 0) 打卡按钮已在眼前：直接点。确认弹窗（不在打卡范围内 → 确认打卡）优先级最高
         if (punchClicks < MAX_PUNCH) {
             for (label in listOf("确认打卡", slot + "打卡", "外出打卡")) {
@@ -535,6 +803,7 @@ class CheckInAccessibilityService : AccessibilityService() {
                 lastPunchTick = ticks
                 lastPunchAt = SystemClock.elapsedRealtime()
                 lastActionAt = lastPunchAt
+                awaitingVerdict = true
                 if (label == "确认打卡") {
                     confirmTick = ticks
                     confirmAt = lastPunchAt
@@ -547,12 +816,35 @@ class CheckInAccessibilityService : AccessibilityService() {
             }
         }
 
-        // 0.5) 成功文案：「打卡成功」是即时反馈可信；「已打卡/更新打卡」要页面像真打卡页
-        val doneText = firstDoneText(root)
-        if (doneText != null &&
-            (doneText.contains("打卡成功") || punchClicks > 0 || exists(root, listOf("打卡记录", "统计")))
-        ) {
+        // 0.5) 成功/受阻判定。这里是「误报成功」的第二道闸：
+        //   a) 明确受阻（定位弱/无定位/网络异常）→ 本次一定不成功，交给中性收尾；
+        //   b) 明确成功文案只在真的点过按钮后才采信（避免进门就被历史「已打卡」骗过）；
+        //   c) 弱证据「已打卡/打卡时间」必须落在本时段栏位旁，才认为是本时段已完成。
+        val verdict = completionState(root)
+        if (verdict == ST_BLOCKED) {
+            val why = firstMatch(root, BLOCKED_TEXTS) ?: "定位/网络异常"
             root.safeRecycle()
+            if (punchClicks > 0) {
+                // 已经点过按钮但被拦住：不是成功，也不能催「补卡」——人已经在流程里了
+                finishBlocked(why)
+            } else {
+                // 还没点就发现环境不满足，点了也白点，直接提示用户本人处理
+                finish(false, "打卡受阻（$why），当前环境无法完成打卡，请手动处理")
+            }
+            return
+        }
+        if (verdict == ST_DONE) {
+            val strong = firstMatch(root, STRONG_SUCCESS_TEXTS)
+            root.safeRecycle()
+            if (strong != null) {
+                if (punchClicks > 0) {
+                    finish(true, "打卡成功（识别文案=$strong）")
+                } else {
+                    finish(true, if (testing) "页面显示已打卡，未重复点击" else "当前已是打卡状态")
+                }
+                return
+            }
+            // 弱证据命中：本时段确实已完成，不再重复点
             finish(true, if (testing) "页面显示已打卡，未重复点击" else "当前已是打卡状态")
             return
         }
@@ -650,7 +942,19 @@ class CheckInAccessibilityService : AccessibilityService() {
             }
         }
 
-        // 6) 预算全部耗尽还没结果：明确失败，不无限重试
+        // 6) 点过打卡按钮但迟迟没有明确结果（既不是成功文案，也不是受阻提示）。
+        //    常见于企微还在转圈校验定位。等满 PUNCH_VERDICT_MS 就中性收尾：
+        //    不判成功（可能没打上）、也不弹「请手动补一下」（人就在流程里，别催）。
+        if (awaitingVerdict && punchClicks > 0 && nowRt - lastPunchAt >= PUNCH_VERDICT_MS) {
+            root.safeRecycle()
+            finishSubmitted(
+                "已点击打卡按钮（$slot），未读到明确结果，请在企业微信确认",
+                remind = true
+            )
+            return
+        }
+
+        // 7) 预算全部耗尽还没结果：明确失败，不无限重试
         if (punchClicks >= MAX_PUNCH && dotsClicks >= MAX_DOTS && enterClicks >= MAX_ENTER) {
             root.safeRecycle()
             finish(false, "已点击打卡按钮 $punchClicks 次但未出现完成提示（可能需拍照/人脸或位置校验）")
@@ -673,7 +977,15 @@ class CheckInAccessibilityService : AccessibilityService() {
         val inWework = pkg == WEWORK
 
         if (inWework) {
-            val dt = firstSuccessText(root!!)
+            // 受阻优先：定位弱/网络异常时「确认打卡」点下去也不会成功，
+            // 不能因为页面上还有「打卡时间」这类常驻文案就判成功
+            val blocked = firstMatch(root!!, BLOCKED_TEXTS)
+            if (blocked != null) {
+                root.safeRecycle()
+                finishBlocked(blocked)
+                return
+            }
+            val dt = firstSuccessText(root)
             if (dt != null) {
                 root.safeRecycle()
                 finish(true, "打卡成功（识别文案=$dt）")
@@ -704,7 +1016,8 @@ class CheckInAccessibilityService : AccessibilityService() {
     }
 
     private fun firstSuccessText(root: AccessibilityNodeInfo): String? {
-        for (t in SUCCESS_TEXTS) {
+        // 只认强证据：「打卡时间」是页面常驻标签，留着就会把「没打成」判成「打成」
+        for (t in STRONG_SUCCESS_TEXTS) {
             if (exists(root, listOf(t))) return t
         }
         return null
@@ -909,6 +1222,37 @@ class CheckInAccessibilityService : AccessibilityService() {
     } catch (e: Exception) {
         Prefs.log(this, "手势点击失败：" + e.message)
         false
+    }
+
+    /**
+     * 打卡受阻收尾：定位弱 / 无定位 / 网络异常等，企微明确提示打不了。
+     *
+     * 关键点：这类情况**绝不能判成功**（以前把「打卡时间」当成功文案，就是在这里误报的），
+     * 同时也**不写完成标记**——写了会导致今天不会再重试，白白漏卡。
+     * 保留 pending 让解锁/唤醒还能再试一次，并用中性文案提醒用户本人处理。
+     */
+    private fun finishBlocked(why: String) {
+        val wasTest = testing
+        running = false
+        testing = false
+        awaitingVerdict = false
+        setContentEvents(false)
+        handler.removeCallbacksAndMessages(null)
+        val prefix = if (wasTest) "[测试] " else ""
+        Prefs.log(this, prefix + "打卡受阻（" + why + "），不判定成功、不写完成状态")
+
+        if (!wasTest) {
+            // 不 clearPending、不 markDone：环境恢复后（走到信号好的地方）还能自动补打
+            Notifier.alert(
+                this,
+                "打卡未成功（" + slot + "）",
+                "企业微信提示「" + why + "」，多半是定位或网络不给力。" +
+                    "请走到信号好的地方手动打卡，或在企业微信确认结果",
+                openWework = true
+            )
+        } else {
+            Notifier.alert(this, prefix + "打卡受阻（" + slot + "）", "识别到「" + why + "」，未完成打卡")
+        }
     }
 
     private fun finish(ok: Boolean, msg: String) {

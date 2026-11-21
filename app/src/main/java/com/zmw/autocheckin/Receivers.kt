@@ -10,6 +10,16 @@ import java.util.Calendar
 /** 顺延超过 12 小时的旧闹钟不再补打：那时段早已过期，补点只会造成错卡 */
 private const val DUE_GRACE_MS = 12 * 60 * 60 * 1000L
 
+/** 状态推送的过期阈值：顺延超过 6 小时的排定直接丢弃，不给新的一天写「已推送」 */
+private const val STATUS_STALE_MS = 6 * 60 * 60 * 1000L
+
+private fun sameDay(a: Long, b: Long): Boolean {
+    val c1 = Calendar.getInstance().apply { timeInMillis = a }
+    val c2 = Calendar.getInstance().apply { timeInMillis = b }
+    return c1.get(Calendar.YEAR) == c2.get(Calendar.YEAR) &&
+        c1.get(Calendar.DAY_OF_YEAR) == c2.get(Calendar.DAY_OF_YEAR)
+}
+
 class AlarmReceiver : BroadcastReceiver() {
 
     override fun onReceive(ctx: Context, intent: Intent) {
@@ -90,16 +100,42 @@ class ResumeReceiver : BroadcastReceiver() {
 
 /**
  * 每日定时打卡状态推送。
- * 三重前置校验：开关是否开启 / 今天是否已推过 / 到点才触发（由闹钟保证）。
+ * 前置校验：开关是否开启 / 今天是否需要打卡 / 今天是否已推过 / 到点才触发（由闹钟保证）。
+ * 「今天不用打卡」直接静默返回：不推通知、不写推送标记，也不占用当日去重额度。
  * 查询可能走网络，用 goAsync + 后台线程，避免阻塞主线程导致 ANR。
  */
 class StatusPushReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent?) {
         if (intent?.action != CheckInScheduler.ACTION_STATUS_DUE) return
         val app = ctx.applicationContext
+        // 必须在 scheduleStatus 覆盖之前取出排定时刻
+        val scheduledAt = Prefs.statusDueAt(app)
         // 先排下一次，避免本次流程异常导致以后不再推
         CheckInScheduler.scheduleStatus(app)
         if (!Prefs.statusPushEnabled(app)) return
+
+        // 今天本来就不用打卡（周末/法定假日/自定义不打卡日）：不推送、不统计
+        val cal = Calendar.getInstance()
+        if (!WorkDay.isWorkDay(app, cal)) {
+            Prefs.log(app, "状态推送：今日" + WorkDay.describe(app, cal) + "，无需打卡，不推送")
+            return
+        }
+
+        // RTC 非唤醒闹钟在设备休眠时顺延，可能拖到隔天才送达。
+        // 这种过期触发直接丢掉：否则会把「今日已推送」写到新的一天，
+        // 反而把第二天本该有的推送压掉。只认 6 小时内的顺延。
+        val now = System.currentTimeMillis()
+        if (scheduledAt > 0L) {
+            val late = now - scheduledAt
+            val stale = late > STATUS_STALE_MS || !sameDay(scheduledAt, now)
+            if (stale) {
+                Prefs.log(
+                    app, "状态推送：本次排定已过期（顺延 " + late / 60_000 + " 分钟），丢弃"
+                )
+                return
+            }
+        }
+
         if (Prefs.statusPushedToday(app)) {
             Prefs.log(app, "今日状态推送已完成，跳过重复触发")
             return

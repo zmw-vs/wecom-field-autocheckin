@@ -36,10 +36,12 @@ object StatusPush {
 
     private fun fromLocal(ctx: Context): Report {
         val cal = Calendar.getInstance()
+        // 定时推送路径已在 Receiver 里把非工作日挡掉了，走不到这里；
+        // 只有用户手动「立即查询」时会看到这条，所以文案说明是手动触发。
         if (!WorkDay.isWorkDay(ctx, cal)) {
             return neutral(
                 "今日无需打卡",
-                "今日" + WorkDay.describe(ctx, cal) + "，按规则不用打卡，不判定已打卡/未打卡。" +
+                "今日" + WorkDay.describe(ctx, cal) + "，按规则不用打卡，不做已打卡/未打卡统计。" +
                     LOCAL_SOURCE
             )
         }

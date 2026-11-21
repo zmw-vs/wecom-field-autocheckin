@@ -36,6 +36,8 @@ object Prefs {
     private const val K_STATUS_USER = "status_user_id"
     private const val K_STATUS_LAST_DATE = "status_last_date"
     private const val K_STATUS_LAST_RESULT = "status_last_result"
+    private const val K_STATUS_FOLLOW = "status_follow_checkin"
+    private const val K_STATUS_DUE_AT = "status_due_at"
     private const val K_DONE_UP = "done_up_date"
     private const val K_DONE_DOWN = "done_down_date"
     private const val K_LOGS = "logs"
@@ -210,6 +212,9 @@ object Prefs {
     const val DEFAULT_STATUS_API = "https://qyapi.weixin.qq.com/cgi-bin/checkin/getcheckindata"
     const val DEFAULT_STATUS_MINUTES = 20 * 60
 
+    /** 跟随打卡时间时，在当天最后一个打卡时间之后延后多少分钟推送 */
+    const val STATUS_FOLLOW_DELAY_MIN = 5
+
     fun statusPushEnabled(ctx: Context): Boolean = sp(ctx).getBoolean(K_STATUS_ENABLED, false)
     fun setStatusPushEnabled(ctx: Context, v: Boolean) =
         sp(ctx).edit().putBoolean(K_STATUS_ENABLED, v).apply()
@@ -218,6 +223,29 @@ object Prefs {
         sp(ctx).getInt(K_STATUS_MINUTES, DEFAULT_STATUS_MINUTES)
     fun setStatusPushMinutes(ctx: Context, m: Int) =
         sp(ctx).edit().putInt(K_STATUS_MINUTES, m).apply()
+
+    /** true=跟随打卡时间自动推算（默认）；false=用户指定固定时间 */
+    fun statusFollowCheckIn(ctx: Context): Boolean =
+        sp(ctx).getBoolean(K_STATUS_FOLLOW, true)
+    fun setStatusFollowCheckIn(ctx: Context, v: Boolean) =
+        sp(ctx).edit().putBoolean(K_STATUS_FOLLOW, v).apply()
+
+    /**
+     * 当天推送时刻（分钟数）。
+     * 跟随打卡时间时取当天最后一个打卡时间 + STATUS_FOLLOW_DELAY_MIN，
+     * 这样两段卡都打完才有结论，不会把还没到点的下班卡算成「未打卡」；
+     * 跨夜班（up > down）下班在次日，故只按下班时间算。
+     */
+    fun statusEffectiveMinutes(ctx: Context): Int {
+        if (!statusFollowCheckIn(ctx)) return statusPushMinutes(ctx)
+        val up = upMinutes(ctx)
+        val down = downMinutes(ctx)
+        val last = if (up <= down) maxOf(up, down) else down
+        val m = last + STATUS_FOLLOW_DELAY_MIN
+        // 贴着午夜打卡时避免推到次日凌晨：跨日会让「今日已推送」标记写到第二天，
+        // 反而压掉第二天的正常推送，所以压到当天 23:59。
+        return if (m >= 1440) 23 * 60 + 59 else m
+    }
 
     fun statusApiUrl(ctx: Context): String =
         sp(ctx).getString(K_STATUS_API, DEFAULT_STATUS_API)?.ifBlank { DEFAULT_STATUS_API }
@@ -261,6 +289,16 @@ object Prefs {
             .apply()
 
     fun statusLastResult(ctx: Context): String = sp(ctx).getString(K_STATUS_LAST_RESULT, "") ?: ""
+
+    /**
+     * 状态推送的排定时刻。RTC 非唤醒闹钟在设备休眠时会顺延，
+     * 记下原定时刻用于判断「这次触发是不是过期了」，避免跨天顺延把
+     * 第二天的推送额度提前消耗掉。
+     */
+    fun setStatusDueAt(ctx: Context, at: Long) =
+        sp(ctx).edit().putLong(K_STATUS_DUE_AT, at).apply()
+
+    fun statusDueAt(ctx: Context): Long = sp(ctx).getLong(K_STATUS_DUE_AT, 0L)
 
     /** 锁屏待办有效期：超过即丢弃，防止跨天残留导致第二天错误补打卡 */
     const val PENDING_STALE_MS = 2 * 60 * 60 * 1000L

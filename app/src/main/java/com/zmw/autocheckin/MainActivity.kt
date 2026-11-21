@@ -176,11 +176,18 @@ class MainActivity : Activity() {
             (if (offCount > 0) "　另休 " + offCount + " 天" else "")
 
         val pushOn = Prefs.statusPushEnabled(this)
-        val pushTime = hhmm(Prefs.statusPushMinutes(this))
+        val pushTime = hhmm(Prefs.statusEffectiveMinutes(this))
         val pushSrc = if (Prefs.statusUseApi(this)) "企业微信接口" else "本机记录"
+        val pushFollow = if (Prefs.statusFollowCheckIn(this)) "" else "固定 "
         btnStatusPush.text = "状态推送\n" + (if (pushOn) "开 · " else "关 · ") +
-            pushTime + " · " + pushSrc
-        btnStatusPush.setTextColor(if (pushOn) COLOR_OK else COLOR_MUTED)
+            pushFollow + pushTime + " · " + pushSrc
+        btnStatusPush.setTextColor(
+            when {
+                !pushOn -> COLOR_MUTED
+                !WorkDay.isWorkDay(this, nowCal) -> COLOR_WARN
+                else -> COLOR_OK
+            }
+        )
 
         val ready = CheckInAccessibilityService.isReady()
         val todayCal = nowCal
@@ -193,7 +200,13 @@ class MainActivity : Activity() {
             sb.append("   下班").append(if (Prefs.isDone(this, "下班")) " ✓已打" else " 未打")
         }
         sb.append("\n状态推送：")
-            .append(if (pushOn) "开 · $pushTime · $pushSrc" else "关（不会触发定时推送）")
+            .append(
+                when {
+                    !pushOn -> "关（不会触发定时推送）"
+                    !workToday -> "开 · 今日无需打卡，不推送"
+                    else -> "开 · $pushTime · $pushSrc"
+                }
+            )
         val last = Prefs.statusLastResult(this)
         if (last.isNotEmpty()) sb.append("\n上次推送：").append(last.take(70))
         tvState.text = sb.toString()
@@ -348,17 +361,32 @@ class MainActivity : Activity() {
         }
 
         val on = Prefs.statusPushEnabled(this)
-        val time = hhmm(Prefs.statusPushMinutes(this))
+        val follow = Prefs.statusFollowCheckIn(this)
+        val effMin = Prefs.statusEffectiveMinutes(this)
+        val time = hhmm(effMin)
         val useApi = Prefs.statusUseApi(this)
         val problem = Prefs.statusConfigProblem(this)
+        val workToday = WorkDay.isWorkDay(this, Calendar.getInstance())
 
         item(
             "定时状态推送开关",
-            if (on) "已开启 · 每天 $time 推送" else "已关闭 · 不会触发定时推送",
-            if (on) COLOR_OK else COLOR_MUTED
+            if (on) {
+                "已开启 · 每天 $time 推送" +
+                    (if (!workToday) "（今日无需打卡，不推送）" else "")
+            } else "已关闭 · 不会触发定时推送",
+            if (!on) COLOR_MUTED else if (workToday) COLOR_OK else COLOR_WARN
         ) { pickStatusSwitch() }
 
-        item("每日推送时间", time, COLOR_NEUTRAL) { pickStatusTime() }
+        item(
+            "推送时间",
+            if (follow) {
+                "$time · 跟随打卡时间（" + lastPunchText(this) + " + " +
+                    Prefs.STATUS_FOLLOW_DELAY_MIN + " 分）"
+            } else {
+                "$time · 固定时间"
+            },
+            if (follow) COLOR_OK else COLOR_INFO
+        ) { pickStatusTimeMode() }
 
         item(
             "状态数据源",
@@ -392,8 +420,10 @@ class MainActivity : Activity() {
 
         box.addView(TextView(this).apply {
             text = "说明：没有企业管理员 access_token 时默认用本机记录，推送文案会标注来源；" +
-                "接口失败、无数据、非工作日、未到打卡时间都只推「状态未确认」，" +
-                "不会误报为已打卡/未打卡。"
+                "推送时间默认跟随打卡时间（最后一个打卡时间后 " + Prefs.STATUS_FOLLOW_DELAY_MIN +
+                " 分钟），两段卡都过点才汇总。\n" +
+                "周末、法定节假日、调休放假等「今日无需打卡」的日子不会推送。" +
+                "接口失败、无数据、未到打卡时间都只推「状态未确认」，不会误报为已打卡/未打卡。"
             textSize = 12f
             setTextColor(0xFF37474F.toInt())
             setPadding(dp(4), dp(8), dp(4), dp(8))
@@ -412,6 +442,7 @@ class MainActivity : Activity() {
         showChoiceDialog(
             title = "定时状态推送",
             message = "开启后每天在设定时间推送当日打卡状态；关闭时不排闹钟、不推送。\n" +
+                "只在需要打卡的日子推送，周末和法定节假日即使开着也不推。\n" +
                 "与「启用定时任务」相互独立，关掉自动打卡也能单独用状态推送。",
             options = listOf(
                 (if (!cur) "✓ " else "　") + "关闭（不触发定时推送）",
@@ -427,12 +458,56 @@ class MainActivity : Activity() {
         }
     }
 
+    /** 弹框里显示用的「当天最后一次打卡时间」，跨夜班按下班时间算 */
+    private fun lastPunchText(ctx: android.content.Context): String {
+        val up = Prefs.upMinutes(ctx)
+        val down = Prefs.downMinutes(ctx)
+        return hhmm(if (up <= down) maxOf(up, down) else down)
+    }
+
+    /** 推送时间有两种来源：跟随打卡时间（默认）或固定时间 */
+    private fun pickStatusTimeMode() {
+        val follow = Prefs.statusFollowCheckIn(this)
+        val now = hhmm(Prefs.statusEffectiveMinutes(this))
+        val fixed = hhmm(Prefs.statusPushMinutes(this))
+        showChoiceDialog(
+            title = "推送时间",
+            message = "跟随打卡时间：在当天最后一个打卡时间之后 " +
+                Prefs.STATUS_FOLLOW_DELAY_MIN + " 分钟推送，两段卡都过点才有结论，" +
+                "不会把还没到点的下班卡算成「未打卡」。\n" +
+                "固定时间：每天按你指定的时间推送。\n" +
+                "两种情况都只在需要打卡的日子推送，周末和法定假日不推送。",
+            options = listOf(
+                (if (follow) "✓ " else "　") + "跟随打卡时间（当前 $now）",
+                (if (!follow) "✓ " else "　") + "固定时间（当前 $fixed，点击修改）"
+            ),
+            highlight = if (follow) 0 else 1
+        ) { which ->
+            if (which == 0) {
+                Prefs.setStatusFollowCheckIn(this, true)
+                CheckInScheduler.scheduleStatus(this)
+                Prefs.log(this, "推送时间改为跟随打卡时间：" + now)
+                refresh()
+            } else {
+                // 切到固定时间时把当前生效值带过去，避免突然跳回 20:00 让人以为设置丢了
+                if (Prefs.statusFollowCheckIn(this)) {
+                    Prefs.setStatusPushMinutes(this, Prefs.statusEffectiveMinutes(this))
+                }
+                Prefs.setStatusFollowCheckIn(this, false)
+                Prefs.log(this, "推送时间改为固定时间")
+                refresh()
+                pickStatusTime()
+            }
+        }
+    }
+
     private fun pickStatusTime() {
         val cur = Prefs.statusPushMinutes(this)
         TimePickerDialog(this, { _, h, m ->
             Prefs.setStatusPushMinutes(this, h * 60 + m)
+            Prefs.setStatusFollowCheckIn(this, false)
             CheckInScheduler.scheduleStatus(this)
-            Prefs.log(this, "状态推送时间改为 " + hhmm(h * 60 + m))
+            Prefs.log(this, "状态推送固定时间改为 " + hhmm(h * 60 + m))
             refresh()
         }, cur / 60, cur % 60, true).show()
     }

@@ -86,8 +86,13 @@ object CheckInScheduler {
     }
 
     /**
-     * 每日固定时间的状态推送闹钟。同样用 RTC 非唤醒：一天一次，
+     * 每日打卡状态推送闹钟。同样用 RTC 非唤醒：一天一次，
      * 设备休眠时不吵醒 CPU、顺延到唤醒后送达，几乎不增加耗电。
+     *
+     * 时间默认跟随用户设置的打卡时间（当天最后一个打卡时间 + 5 分钟），
+     * 保证两段卡都过点之后才汇总，不会把「还没到点的下班卡」算成未打卡；
+     * 用户也可以改成固定时间。
+     * 排定时直接跳过非工作日 —— 今天本来就不用打卡，就没必要在当天推送统计。
      */
     fun scheduleStatus(ctx: Context) {
         val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
@@ -95,23 +100,46 @@ object CheckInScheduler {
         am.cancel(pi)
         if (!Prefs.statusPushEnabled(ctx)) return
 
-        val m = Prefs.statusPushMinutes(ctx)
-        val at = Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, m / 60)
-            set(Calendar.MINUTE, m % 60)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
-        }.let { c ->
-            if (c.timeInMillis <= System.currentTimeMillis() + 30_000L) {
-                c.add(Calendar.DAY_OF_YEAR, 1)
-            }
-            c.timeInMillis
+        val at = nextStatusAt(ctx)
+        if (at <= 0L) {
+            Prefs.log(ctx, "状态推送：60 天内没有需要打卡的日子，暂不排定")
+            return
         }
+        Prefs.setStatusDueAt(ctx, at)
         val exact = Build.VERSION.SDK_INT < Build.VERSION_CODES.S || am.canScheduleExactAlarms()
         if (exact) am.setExact(AlarmManager.RTC, at, pi) else am.set(AlarmManager.RTC, at, pi)
         val source = if (Prefs.statusUseApi(ctx)) "企业微信接口" else "本机记录"
-        Prefs.log(ctx, "下次状态推送 " + fmt(at) + "（数据源：" + source + "）")
+        Prefs.log(ctx, "下次状态推送 " + fmt(at) + "（" +
+                (if (Prefs.statusFollowCheckIn(ctx)) "跟随打卡 " else "固定 ") + hhmm(Prefs.statusEffectiveMinutes(ctx)) +
+                " · 数据源：" + source + "）")
     }
+
+    /**
+     * 下一次该推送的时刻：只在工作日排。
+     * 用与主闹钟同一套 WorkDay 判定（周几掩码 + 法定节假日 + 调休补班 + 自定义不打卡日），
+     * 保证「今天不用打卡」时既不推、也不排。
+     */
+    private fun nextStatusAt(ctx: Context): Long {
+        val m = Prefs.statusEffectiveMinutes(ctx)
+        val now = System.currentTimeMillis()
+        val base = Calendar.getInstance()
+        for (offset in 0..60) {
+            val day = (base.clone() as Calendar).apply { add(Calendar.DAY_OF_YEAR, offset) }
+            if (!WorkDay.isWorkDay(ctx, day)) continue
+            val t = (base.clone() as Calendar).apply {
+                add(Calendar.DAY_OF_YEAR, offset)
+                set(Calendar.HOUR_OF_DAY, m / 60)
+                set(Calendar.MINUTE, m % 60)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }
+            if (t.timeInMillis > now + 30_000L) return t.timeInMillis
+        }
+        return -1L
+    }
+
+    private fun hhmm(minutes: Int): String =
+        String.format(Locale.US, "%02d:%02d", minutes / 60, minutes % 60)
 
     fun cancelStatus(ctx: Context) {
         val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager

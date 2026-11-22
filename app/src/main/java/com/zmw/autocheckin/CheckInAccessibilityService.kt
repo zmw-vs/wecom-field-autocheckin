@@ -62,6 +62,9 @@ class CheckInAccessibilityService : AccessibilityService() {
         private const val SETTLE_MS = 1500L
         private const val ENTRY_LOAD_MS = 900L
 
+        /** 拉起企微后给系统的缓冲时间，超过这个时长企微进程还没起，判定被 MARs 终止 */
+        private const val WEWORK_GONE_GRACE_MS = 6000L
+
         /**
          * 各阶段独立限次。必须限制：点完一次后页面可能停在同一界面，
          * 无上限会每 2 秒重复点，既耗电又可能反复触发拍照/人脸弹窗。
@@ -109,7 +112,6 @@ class CheckInAccessibilityService : AccessibilityService() {
         /** 企微停在内页（聊天/文档/邮件/设置）时按返回退回主界面，最多几次 */
         private const val MAX_BACK = 5
         private const val AFTER_BACK = 800L
-        private const val MAX_RELAUNCH = 2
 
         /** completionState 结果 */
         private const val ST_NONE = 0
@@ -219,12 +221,10 @@ class CheckInAccessibilityService : AccessibilityService() {
 
     /**
      * 企微被用户停在聊天/文档/邮件等内页时，底部标签栏不可见，够不到「工作台」。
-     * 这里靠「按返回退回主界面」+「必要时重新拉起」两条兜底，不再是空转到超时。
+     * 靠「按返回逐层退回主界面」解决，次数受限，不做重新拉起（会崩企微进程）。
      */
     private var backs = 0
-    private var relaunches = 0
     private var lastBackAt = 0L
-    private var lastRelaunchAt = 0L
 
     /** 点完打卡按钮、还没拿到明确结论时，用于「中性收尾」的超时基准 */
     private var awaitingVerdict = false
@@ -626,9 +626,7 @@ class CheckInAccessibilityService : AccessibilityService() {
         scrolls = 0
         lastScrollTick = 0
         backs = 0
-        relaunches = 0
         lastBackAt = 0L
-        lastRelaunchAt = 0L
         awaitingVerdict = false
         lastPunchTick = 0
         confirmTick = -1
@@ -652,28 +650,54 @@ class CheckInAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 把企微拉到前台。
+     * 把企微拉到前台。**企微已经在前台时绝不调用 startActivity。**
      *
-     * 关键：企微已经打开过、停在内页（聊天/文档/邮件）时，单靠 launch intent +
-     * RESET_TASK_IF_NEEDED 是「恢复原样」，仍然停在那个内页，底部标签栏看不见，
-     * 就永远点不到「工作台」——这正是「打开过企微后程序卡住不动」的直接原因。
+     * 三星 MARs（自动运行管理）的坑（11-22 实机抓日志确认）：
      *
-     * 用 CLEAR_TOP | SINGLE_TOP 让它在已有任务栈上回到根 Activity（主界面），
-     * 标签栏就回来了。仍然失败的话，tick 里还有「按返回」兜底。
+     *   19:01:15.527 FASProvider: package_name=com.zmw.autocheckin
+     *                reason=deleted_from_mars_auto mode=1 level=2
+     *   19:01:17.907 ActivityManager: Force stopping com.tencent.wework: MARs #2
+     *   19:01:17.931 MARsPolicyManager: Recent_Kill: add mRestrictedPackages
+     *                com.tencent.wework policy --autorun(2)
+     *
+     * 本应用被三星判成「自动运行可疑应用」（deleted_from_mars_auto，level=2）。
+     * 它一旦 startActivity 拉起企微，MARs 就认定企微是被可疑应用自动启动的，
+     * 直接 Force stop 掉整个企微进程并加入受限包。用户看到的就是「企微崩溃、
+     * 打不开」——而且连手动点图标都恢复不了，因为企微已被限制。
+     *
+     * 实测对照：
+     *   - 企微已在前台，只发 GLOBAL_ACTION_BACK：pid 不变，MARs 不动 ✅
+     *   - 企微已在前台，仍 startActivity：pid 立刻消失，MARs Force stop ❌
+     *
+     * 所以分两条路：
+     *   1) 企微已在前台 → 一次都不拉起，纯靠无障碍点 + 返回键导航。
+     *   2) 企微不在前台 → 才需要拉起，这是唯一会碰 MARs 的路径，留给系统
+     *      冷启动，不加任何 CLEAR_TOP（那会重跑闪屏，是更早一版的崩溃原因）。
      */
     private fun launchWework(): Boolean {
+        // 企微已经在最前台：什么都不做，直接开始 tick。
+        // 这是最关键的一条——实测「已在前台仍拉起」必被 MARs 杀掉企微。
+        val cur = rootInActiveWindow
+        val curPkg = cur?.packageName?.toString()
+        cur.safeRecycle()
+        if (curPkg == WEWORK) {
+            Prefs.log(this, "企微已在前台，跳过拉起（避免触发三星 MARs 自动运行拦截）")
+            return true
+        }
+
         val launch = packageManager.getLaunchIntentForPackage(WEWORK)
         if (launch == null) {
             finish(false, "未安装企业微信")
             return false
         }
+        // 只做「置前」，不用 CLEAR_TOP/CLEAR_TASK：那个 intent 指向企微的启动
+        // 闪屏 Activity，清栈会让它重跑冷启动初始化，踩到已存在的进程级单例。
         launch.addFlags(
-            Intent.FLAG_ACTIVITY_NEW_TASK or
-                Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                Intent.FLAG_ACTIVITY_SINGLE_TOP
+            Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
         )
         return try {
             startActivity(launch)
+            Prefs.log(this, "企微不在前台，已拉起（注意：三星设备可能触发 MARs 拦截）")
             true
         } catch (e: Exception) {
             finish(false, "启动企业微信失败：" + e.message)
@@ -699,6 +723,45 @@ class CheckInAccessibilityService : AccessibilityService() {
             contentEventsOn = on
         } catch (e: Exception) {
             Prefs.log(this, "调整事件监听失败：" + e.message)
+        }
+    }
+
+    /**
+     * 企微是否还「在系统里活着」。
+     *
+     * **不能用 ActivityManager.getRunningAppProcesses()**：Android 11+ 起它只返回
+     * 调用者自己那一个进程，查别的包永远是空，会一直被误判成「企微没了」
+     * （11-22 实测：企微 pid 29898 明明活着，却被判成被 MARs 终止）。
+     *
+     * 只走 /proc 扫描：能读到 cmdline 且包含包名 = 活着。判定规则刻意做得极保守：
+     *   - /proc 列不出东西，或读到的进程数太少（<20）→ 说明权限被限制，无法判断，
+     *     一律当「活着」，宁可多等 6 秒也不要误报失败；
+     *   - 只有「明确读到几十个进程、逐个看完确实没有企微」才返回 false。
+     *
+     * 这个函数只在「企微不在前台」的分支里用，误判代价是弹一条错误的失败提示，
+     * 所以保守优先。
+     */
+    private fun isWeworkAlive(): Boolean {
+        return try {
+            val pids = java.io.File("/proc").list() ?: return true
+            var readable = 0
+            for (name in pids) {
+                if (name.isEmpty() || name[0] < '0' || name[0] > '9') continue
+                val f = java.io.File("/proc/$name/cmdline")
+                if (!f.canRead()) continue
+                readable++
+                val cmd = try {
+                    f.readText()
+                } catch (_: Exception) {
+                    continue
+                }
+                if (cmd.contains(WEWORK)) return true
+            }
+            // 读得太少说明 /proc 被系统屏蔽，判断不了 → 当活着
+            if (readable < 20) return true
+            false
+        } catch (_: Exception) {
+            true
         }
     }
 
@@ -750,6 +813,19 @@ class CheckInAccessibilityService : AccessibilityService() {
                 )
                 return
             }
+            // 还没点到打卡按钮，企微进程却没了：三星 MARs（自动运行管理）把企微
+            // Force stop 掉的典型表现——用户看到的就是「企微崩溃、打不开」。
+            // 与其空转到 MAX_TICK 超时只说「未完成」，不如直接点明原因和解决办法。
+            if (punchClicks == 0 && !isWeworkAlive() && nowRt - beginAt > WEWORK_GONE_GRACE_MS) {
+                Prefs.log(this, "企微进程已不存在，判定为被系统（MARs）终止")
+                finish(
+                    false,
+                    "企业微信被系统终止了（三星「自动运行管理」拦截了本应用拉起企微）。" +
+                        "解决办法：设置 → 电池和设备维护 → 电池 → 后台使用限制，" +
+                        "把「外勤打卡助手」和「企业微信」都设为「不受限制」，再重试"
+                )
+                return
+            }
             handler.postDelayed(tickRunnable, TICK)
             return
         }
@@ -763,12 +839,11 @@ class CheckInAccessibilityService : AccessibilityService() {
         // 0) 先确认自己站在能找到打卡入口的地方。
         //    企微被打开过、停在聊天/文档/邮件等内页时，底部标签栏不可见，
         //    下面所有「工作台 / 打卡」的匹配都会落空，只能空转到超时。
-        //    这里主动把界面退回主界面：先按返回，返回无效再重新拉起（带 CLEAR_TOP）。
+        //    正确做法：用返回键逐层退回主界面（跟用户手按返回完全一样，安全）。
+        //    绝不重新拉起带 CLEAR_TOP —— 那会重建企微闪屏并崩掉它的进程。
         if (!atNavigableSurface(root)) {
             if (punchClicks == 0 && nowRt - lastBackAt >= AFTER_BACK) {
                 val inner = looksInnerPage(root)
-                // 明确是内页才按返回；判不出来时也允许退（可能是 H5 覆盖），
-                // 但次数受限，且每次都会因为页面变化而重新判定，不会一路退到桌面。
                 if (backs < MAX_BACK) {
                     backs++
                     lastBackAt = nowRt
@@ -779,18 +854,17 @@ class CheckInAccessibilityService : AccessibilityService() {
                     handler.postDelayed(tickRunnable, AFTER_BACK)
                     return
                 }
-                // 返回压不住（可能在深层页面或被弹窗拦着）：重新拉起一次，回到根界面
-                if (relaunches < MAX_RELAUNCH && nowRt - lastRelaunchAt >= 1500L) {
-                    relaunches++
-                    lastRelaunchAt = nowRt
-                    lastActionAt = nowRt
-                    backs = 0
-                    Prefs.log(this, "返回无法回主界面，重新拉起企微（第 $relaunches 次）")
-                    root.safeRecycle()
-                    if (!launchWework()) return
-                    handler.postDelayed(tickRunnable, AFTER_ENTRY)
-                    return
-                }
+                // 连按返回都回不到主界面：别再折腾企微了。
+                // 之前的「重新拉起」在 CLEAR_TOP 时代是崩溃元凶；现在即便不带 flag，
+                // 反复拉起一个自身状态异常的企微也可能加重问题，所以这里直接收尾报失败，
+                // 把处置权交还用户，比冒险把对方进程搞崩要好。
+                Prefs.log(this, "按返回 $backs 次仍未回到企微主界面，放弃本次自动打卡")
+                root.safeRecycle()
+                finish(
+                    false,
+                    "企微停在非常规页面，按返回 $backs 次未回到主界面，请手动打开企业微信后重试"
+                )
+                return
             }
         }
 

@@ -66,6 +66,12 @@ class CheckInAccessibilityService : AccessibilityService() {
         private const val WEWORK_GONE_GRACE_MS = 6000L
 
         /**
+         * 企微冷启动保护期：这段时间内界面还不完整（闪屏/白屏），
+         * 一律只等不按返回，否则会把企微自己的启动流程打断。
+         */
+        private const val LAUNCH_PROTECT_MS = 5000L
+
+        /**
          * 各阶段独立限次。必须限制：点完一次后页面可能停在同一界面，
          * 无上限会每 2 秒重复点，既耗电又可能反复触发拍照/人脸弹窗。
          */
@@ -645,6 +651,8 @@ class CheckInAccessibilityService : AccessibilityService() {
 
         Prefs.log(this, (if (isTest) "[测试] 开始自动打卡：" else "开始自动打卡：") + slot)
         launchWework()
+        // 首轮稍等一下再扫，冷启动期间的界面保护由 LAUNCH_PROTECT_MS 统一负责，
+        // 这里只避免第一帧就扫到还在过渡的空树。
         handler.postDelayed(tickRunnable, FIRST_DELAY)
         return true
     }
@@ -669,10 +677,25 @@ class CheckInAccessibilityService : AccessibilityService() {
      *   - 企微已在前台，只发 GLOBAL_ACTION_BACK：pid 不变，MARs 不动 ✅
      *   - 企微已在前台，仍 startActivity：pid 立刻消失，MARs Force stop ❌
      *
-     * 所以分两条路：
+     * 三星 Freecess 冻结的坑（11-26 实机抓日志确认）：
+     *
+     *   08:07:55.706 START ... cmp=com.tencent.wework/.launch.LaunchSplashActivity
+     *                from uid 10535 (com.zmw.autocheckin) (BAL_ALLOW_VISIBLE_WINDOW)
+     *   08:07:55.712 topResumedActivity=com.zmw.autocheckin/.MainActivity   ← 我们仍占前台
+     *   08:08:09.961 FreecessController: FZ : com.tencent.wework(10324) reason: Bg
+     *   08:08:13.957 ActivityManager: freezing 25782 com.tencent.wework
+     *
+     * 只发 startActivity、自己却还赖在前台，企微的闪屏任务会被系统当成「后台」，
+     * 刚起来就被 Freecess 冻住，永远走不到主界面——表现就是「企微闪退、打不开」。
+     * 对照实验证明这不是企微的问题：
+     *   adb shell am start（无应用抢前台）→ UFZ reason: activity，正常进 WwMainActivity ✅
+     *   本应用 startActivity 后仍占前台        → FZ  reason: Bg，卡死闪屏 ❌
+     *
+     * 所以分三条路：
      *   1) 企微已在前台 → 一次都不拉起，纯靠无障碍点 + 返回键导航。
-     *   2) 企微不在前台 → 才需要拉起，这是唯一会碰 MARs 的路径，留给系统
-     *      冷启动，不加任何 CLEAR_TOP（那会重跑闪屏，是更早一版的崩溃原因）。
+     *   2) 企微不在前台 → 先把自己的任务退到后台，再 startActivity，
+     *      把前台完整让给企微，避免它被判成后台应用冻结。
+     *   3) 不加任何 CLEAR_TOP（重跑闪屏是更早一版的崩溃原因）。
      */
     private fun launchWework(): Boolean {
         // 企微已经在最前台：什么都不做，直接开始 tick。
@@ -690,14 +713,21 @@ class CheckInAccessibilityService : AccessibilityService() {
             finish(false, "未安装企业微信")
             return false
         }
+
         // 只做「置前」，不用 CLEAR_TOP/CLEAR_TASK：那个 intent 指向企微的启动
         // 闪屏 Activity，清栈会让它重跑冷启动初始化，踩到已存在的进程级单例。
         launch.addFlags(
             Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
         )
+
+        // 时序很重要：必须「此刻」就 startActivity。
+        // 此时本应用的 Activity 还可见，能拿到 BAL_ALLOW_VISIBLE_WINDOW（最高优先级），
+        // 企微才被允许真正切到前台。如果先退后台再启动，只能拿到 BAL_ALLOW_TOKEN，
+        // 系统只创建任务不切前台，企微随即被判成 Bg 冻结——这就是闪退的真因。
+        // 让出前台的动作交给触发方（MainActivity）在启动之后再延迟执行。
         return try {
             startActivity(launch)
-            Prefs.log(this, "企微不在前台，已拉起（注意：三星设备可能触发 MARs 拦截）")
+            Prefs.log(this, "企微不在前台，已拉起")
             true
         } catch (e: Exception) {
             finish(false, "启动企业微信失败：" + e.message)
@@ -841,7 +871,19 @@ class CheckInAccessibilityService : AccessibilityService() {
         //    下面所有「工作台 / 打卡」的匹配都会落空，只能空转到超时。
         //    正确做法：用返回键逐层退回主界面（跟用户手按返回完全一样，安全）。
         //    绝不重新拉起带 CLEAR_TOP —— 那会重建企微闪屏并崩掉它的进程。
+        //
+        //    重要：企微刚被拉起的头几秒是冷启动，闪屏还没走完，界面里既没有
+        //    标签栏也没有打卡字样。这时候按返回会把企微自己的启动流程打断，
+        //    它明明要进 WwMainActivity 了却被退回桌面——11-26 实测：企微在
+        //    57.336 已经启动 WwMainActivity，我们 57.238 就按了返回，正好抢在它前面。
+        //    所以冷启动期间一律只等不按，把保护期留足。
         if (!atNavigableSurface(root)) {
+            val launching = nowRt - beginAt < LAUNCH_PROTECT_MS
+            if (launching) {
+                root.safeRecycle()
+                handler.postDelayed(tickRunnable, TICK)
+                return
+            }
             if (punchClicks == 0 && nowRt - lastBackAt >= AFTER_BACK) {
                 val inner = looksInnerPage(root)
                 if (backs < MAX_BACK) {
